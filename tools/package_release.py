@@ -36,7 +36,7 @@ for directory in ('docs','licenses'):
         if p.is_file():files[p.relative_to(root).as_posix()]=p
 for name in ('README.md','LICENSE','THIRD_PARTY_NOTICES.md'):
     if (root/name).is_file():files[name]=root/name
-if project=='sk83_na_m':files['docs/ZD_FEATURES.md']=root/'src/zd_debug/README.md'
+if project=='sk83_na_m':files['src/zd_debug/README.md']=root/'src/zd_debug/README.md'
 manifest={name:hashlib.sha256(p.read_bytes()).hexdigest() for name,p in sorted(files.items())}
 args.output.parent.mkdir(parents=True,exist_ok=True)
 with zipfile.ZipFile(args.output,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
