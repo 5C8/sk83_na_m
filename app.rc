@@ -1,4 +1,4 @@
-// Game artwork is loaded from the user-provided game files at runtime.
+// The exe icon (resources/icon.ico) is added by CMakeLists.txt (sk83_icon.rc).
 
 // Same version block as skate3recomp's src/skate3.rc.in (which fills it from
 // CMake). Keep the numbers in step with project(... VERSION) in

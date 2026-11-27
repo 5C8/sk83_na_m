@@ -42,6 +42,8 @@ Fixes
   thread's atomic operations use.
 - **Animation precision:** two-frame animation decoding now rounds exactly like
   the game.
+- **Executable icon:** the icon is now part of the repository
+  (`resources/icon.ico`) and built into `sk83_na_m.exe`.
 
 Vulkan
 

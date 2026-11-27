@@ -192,6 +192,14 @@ set_source_files_properties(
 if(WIN32)
   enable_language(RC)   # skip if already enabled
   target_sources(sk83_na_m PRIVATE app.rc)
+  # Exe icon (Explorer + the SDK window class's MAINICON).
+  set(SK83_ICON_FILE ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.ico)
+  if(EXISTS ${SK83_ICON_FILE})
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/sk83_icon.rc "MAINICON ICON \"${SK83_ICON_FILE}\"\n")
+    target_sources(sk83_na_m PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/sk83_icon.rc)
+    set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/sk83_icon.rc PROPERTIES
+        OBJECT_DEPENDS ${SK83_ICON_FILE})
+  endif()
 endif()
 
 
