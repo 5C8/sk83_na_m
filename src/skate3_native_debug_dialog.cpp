@@ -26,6 +26,15 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
 
 // Hook-layer master (boot-time), shown read-only.
 REXCVAR_DECLARE(bool, skate3_native_render);
+REXCVAR_DECLARE(bool, sk83_present_clock);
+REXCVAR_DECLARE(bool, sk83_native_physics);
+REXCVAR_DECLARE(bool, sk83_native_physics_verify);
+REXCVAR_DECLARE(std::string, sk83_native_physics_skip);
+REXCVAR_DECLARE(bool, sk83_native_anim);
+REXCVAR_DECLARE(bool, sk83_native_collision);
+REXCVAR_DECLARE(double, sk83_present_clock_late_pct);
+REXCVAR_DECLARE(double, sk83_guest_profile);
+REXCVAR_DECLARE(bool, sk83_guest_profile_main);
 REXCVAR_DECLARE(bool, skate3_native_render_scene);
 // SDK: emulated-draw suppression while the native output is active.
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
@@ -1316,6 +1325,101 @@ void DrawDiagnosticsSection() {
     if (ImGui::SliderFloat("pan amplitude (0 = full spin)", &amp, 0.0f, 60.0f, "%.0f")) {
       REXCVAR_SET(skate3_native_render_scene_synthetic_pan_amp, double(amp));
     }
+    {
+      const bool np = CvarCheckbox(
+          "Native physics solver", REXCVAR_GET(sk83_native_physics),
+          "Runs the rw::physics solver job as native code (sk83_native_physics): same "
+          "results bit for bit as the recompiled functions. 'physics:' log lines every 10 s "
+          "show the per-stage times in either mode.");
+      if (np != REXCVAR_GET(sk83_native_physics)) REXCVAR_SET(sk83_native_physics, np);
+      const bool nv = CvarCheckbox(
+          "  verify physics compilers", REXCVAR_GET(sk83_native_physics_verify),
+          "Runs the contact/joint/drive compilers both ways on the same input and logs "
+          "'physics verify' lines with any difference (sk83_native_physics_verify).");
+      if (nv != REXCVAR_GET(sk83_native_physics_verify)) REXCVAR_SET(sk83_native_physics_verify, nv);
+      static char skip[160] = {};
+      static bool skip_init = false;
+      if (!skip_init) {
+        snprintf(skip, sizeof(skip), "%s", REXCVAR_GET(sk83_native_physics_skip).c_str());
+        skip_init = true;
+      }
+      if (ImGui::InputText("  stages kept recompiled", skip, sizeof(skip))) {
+        REXCVAR_SET(sk83_native_physics_skip, std::string(skip));
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Comma-separated: islands,contacts,joints,drives,iter,iter-island,integrate,"
+            "spy-c,spy-j,spy-d (or all)");
+      }
+    }
+    {
+      const bool na = CvarCheckbox(
+          "Native animation jobs", REXCVAR_GET(sk83_native_anim),
+          "Runs decompiled animation job functions (PoseWithMatMult, ACSsqtBlend_job) as native code "
+          "(sk83_native_anim): same results bit for bit. 'anim:' log lines every 10 s.");
+      if (na != REXCVAR_GET(sk83_native_anim)) REXCVAR_SET(sk83_native_anim, na);
+    }
+    {
+      const bool nc = CvarCheckbox(
+          "Native collision", REXCVAR_GET(sk83_native_collision),
+          "Runs decompiled collision functions (UnitGetOverlappingGPInstances) as native code "
+          "(sk83_native_collision): same results bit for bit. 'collision:' log lines every 10 s.");
+      if (nc != REXCVAR_GET(sk83_native_collision)) REXCVAR_SET(sk83_native_collision, nc);
+    }
+    {
+      const bool pc = CvarCheckbox(
+          "Even presentation clock", REXCVAR_GET(sk83_present_clock),
+          "Interpolates sim frames on a continuous clock trailing the newest frame "
+          "(sk83_present_clock). Off = the game's own clock: jumps to each new frame and "
+          "freezes (alpha 1.0) until the next one; ~65% of frames held during a pan.");
+      if (pc != REXCVAR_GET(sk83_present_clock)) {
+        REXCVAR_SET(sk83_present_clock, pc);
+        // The clock's evenness reaches the screen through the native
+        // smoother (it plays exactly on the clock); they go together.
+        if (pc) REXCVAR_SET(skate3_native_render_scene_smooth_camera, true);
+      }
+      const double late = CvarSlider(
+          "late frames allowed (%)", REXCVAR_GET(sk83_present_clock_late_pct), 0.05f, 5.0f,
+          "%.2f",
+          "The clock measures when sim frames arrive and picks the smallest delay at which "
+          "only this share of frames arrives after it is due (each one is a short hold). "
+          "Lower = fewer holds, slightly more delay (present-clock log).");
+      if (late != REXCVAR_GET(sk83_present_clock_late_pct))
+        REXCVAR_SET(sk83_present_clock_late_pct, late);
+    }
+    if (ImGui::Button("Profile guest render thread (20 s)")) {
+      // Re-arms on a value change; a fractional counter keeps each press new.
+      static int s_presses = 0;
+      REXCVAR_SET(sk83_guest_profile_main, false);
+      REXCVAR_SET(sk83_guest_profile, 20.0 + 0.001 * double(++s_presses));
+    }
+    if (ImGui::Button("Profile main/sim thread (60 s)")) {
+      static int s_presses = 0;
+      REXCVAR_SET(sk83_guest_profile_main, true);
+      REXCVAR_SET(sk83_guest_profile, 60.0 + 0.001 * double(++s_presses));
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Samples the main (sim) thread for 60 s and writes "
+                        "logs/mainprof_<ts>.txt: what it does in slow sim ticks (the 'sim' "
+                        "stutter bursts). Skate normally; the bursts are occasional.");
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Samples the guest render thread at ~2 kHz and writes "
+                        "logs/guestprof_<ts>.txt: the game functions with the most extra time "
+                        "in slow frames (running and blocked). Play normally while it runs.");
+    }
+    if (ImGui::Button("Latency test (25 s)")) {
+      skate3::native_scene::RecordLatencyTest(25.0);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Measures stick-to-screen delay and smoothness for the CURRENT settings "
+          "(native renderer on). Close this window, stand still, leave the camera at rest; "
+          "then: flick the right stick fully to one side and let go, about once a second, "
+          "10 times; then hold the stick to one side (steady pan) until the log says "
+          "'pace recorder wrote'. Analyse: python tools/latency_lab.py <logs dir>.");
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Record camera signal (8 s)")) {
       skate3::native_scene::RecordCameraSignal(8.0);
     }

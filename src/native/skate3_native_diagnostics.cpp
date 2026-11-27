@@ -49,6 +49,9 @@ REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_frames, 4, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Defined in skate3_native_scene.cpp (the recording filter lives there).
 REXCVAR_DECLARE(bool, skate3_native_render_snapshot_all_draws);
+namespace sk83_guest_profiler {
+void NoteSimTick();  // sk83_guest_profiler.cpp
+}
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_photo_compose_trace, false, "Skate 3",
     "Auto-capture an F10-style diagnostic recording (all draws, ~360 "
@@ -89,6 +92,8 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_capture_hotkeys, false, "Skate 3",
                     "file. Off = no key/pad polling and no capture output.")
     .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DECLARE(double, skate3_native_render_scene_pace_record);
 
 namespace skate3::native_scene {
 
@@ -286,7 +291,14 @@ struct CamSigEntry {
   double t;       // host time (sampler push / frame build)
   double play_t;  // kind 1 only: the smoother's playback time
   float yaw;      // heading, degrees
-  uint8_t kind;   // 0 = raw sampler pose, 1 = smoothed frame, 2 = raw frame
+  uint8_t kind;   // 0 = raw sampler pose, 1 = smoothed frame, 2 = raw frame,
+                  // 3 = RealTimeController update, 4 = sim tick started
+  // 3 = RealTimeController update, 4 = sim tick started, 5 = presentation
+  // clock (sk83_present_clock), 6 = pad right stick (1 kHz host poll),
+  // 7 = sim frame written (DataTracker::StoreFrame)
+  uint32_t tick = 0;   // 3: target frame; 4: tick; 5: newest frame; 7: frame number
+  float alpha = 0.0f;  // 3: blend; 5: actual lead; 6: stick X (-1..1); 7: tracker id
+  float dt = 0.0f;     // 3: frame dt; 5: lead target; 6: stick Y (-1..1)
 };
 std::mutex g_camsig_mutex;
 std::vector<CamSigEntry> g_camsig;
@@ -301,6 +313,13 @@ void CamSigPush(double t, double play_t, float yaw, uint8_t kind) {
   std::lock_guard<std::mutex> lock(g_camsig_mutex);
   if (g_camsig.size() < 200000) {
     g_camsig.push_back({t, play_t, yaw, kind});
+  }
+}
+
+void CamSigPushTick(double t, uint8_t kind, uint32_t tick, float alpha, float dt) {
+  std::lock_guard<std::mutex> lock(g_camsig_mutex);
+  if (g_camsig.size() < 200000) {
+    g_camsig.push_back({t, 0.0, 0.0f, kind, tick, alpha, dt});
   }
 }
 
@@ -332,11 +351,11 @@ void CamSigFrameTick(double rec_now, const float cam_view[16],
       std::snprintf(path, sizeof(path), "logs/cam_signal_%lld.csv",
                     static_cast<long long>(std::time(nullptr)));
       std::ofstream f(path);
-      f << "kind,t,play_t,yaw_deg\n";
-      char line[128];
+      f << "kind,t,play_t,yaw_deg,tick,alpha,dt\n";
+      char line[160];
       for (const CamSigEntry& e : entries) {
-        std::snprintf(line, sizeof(line), "%d,%.6f,%.6f,%.5f\n", int(e.kind), e.t,
-                      e.play_t, double(e.yaw));
+        std::snprintf(line, sizeof(line), "%d,%.6f,%.6f,%.5f,%u,%.5f,%.6f\n", int(e.kind),
+                      e.t, e.play_t, double(e.yaw), e.tick, double(e.alpha), double(e.dt));
         f << line;
       }
       REXLOG_INFO("native-scene cam-signal: wrote {} entries -> {}", entries.size(),
@@ -349,15 +368,65 @@ void RecordCameraSignal(double seconds) {
   {
     std::lock_guard<std::mutex> lock(g_camsig_mutex);
     g_camsig.clear();
-    g_camsig.reserve(size_t(seconds * 1400.0));
+    g_camsig.reserve(size_t(seconds * 3000.0));
   }
   const double now = std::chrono::duration<double>(
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count();
   g_camsig_deadline.store(now + seconds, std::memory_order_release);
+  // Pad right stick at ~1 kHz on its own thread (kind 6): the input side of
+  // the latency test. Every change is kept, plus a 10 ms heartbeat.
+  std::thread([deadline = now + seconds]() {
+    // High-resolution waitable timer: ~0.5 ms waits without raising the
+    // global timer resolution (plain Sleep is 1-15.6 ms).
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    SHORT lx = 0x7FFF, ly = 0x7FFF;
+    double last_push = 0.0;
+    for (;;) {
+      const double t = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+      if (t >= deadline) break;
+      XINPUT_STATE xs{};
+      if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
+        const SHORT x = xs.Gamepad.sThumbRX, y = xs.Gamepad.sThumbRY;
+        if (x != lx || y != ly || t - last_push > 0.01) {
+          CamSigPushTick(t, 6, 0, std::max(-1.0f, x / 32767.0f), std::max(-1.0f, y / 32767.0f));
+          lx = x;
+          ly = y;
+          last_push = t;
+        }
+      }
+      if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -5000;  // 0.5 ms, relative, 100 ns units
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, 5);
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+      }
+    }
+    if (timer) CloseHandle(timer);
+  }).detach();
   REXLOG_INFO(
       "native-scene cam-signal: recording {} s; pan the camera with the stick at a "
       "steady rate NOW",
+      seconds);
+}
+
+// Latency test: the camera-signal window (stick, sim frames, guest camera,
+// clock) plus the present recorder (every present with its view) over the
+// same seconds; tools/latency_lab.py joins the two files.
+void RecordLatencyTest(double seconds) {
+  static int s_arm = 0;
+  RecordCameraSignal(seconds);
+  // The pace recorder re-arms when its cvar value changes.
+  REXCVAR_SET(skate3_native_render_scene_pace_record, seconds + 0.001 * double(++s_arm % 100));
+  REXLOG_INFO(
+      "latency-test: recording {} s. Camera at rest, then flick the right stick fully and "
+      "release, ~1 s apart, 10 times; then pan steadily for the rest",
       seconds);
 }
 
@@ -1019,3 +1088,68 @@ void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
 
 }  // namespace skate3::native_scene
 
+// ---- Sim tick probe (camera-signal recorder kinds 3 / 4) ----------------------
+// The game's sim advances in fixed ticks: the render thread's
+// DataSystem::RealTimeController::Implementation::Update(dt) accumulates real
+// time in 1/60 s periods and publishes the target tick (+12) and the fraction
+// toward the next (+16); the main thread's Sk8::SimController::
+// GenerateSyncCommand starts ONE tick when the controller says it is due
+// (returns 1; the tick counter is at +20). Recorded only while the camera-signal
+// window is open, to test whether the camera moves evenly PER TICK (then the
+// native smoother can interpolate on tick time with ~1 tick of delay).
+namespace {
+double SimTickNow() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+// RealTimeController::Implementation::Update (kind 3/5 entries) is hooked in
+// sk83_present_clock.cpp, which logs into this recorder.
+
+extern "C" REX_FUNC(rex_Sk8_SimController_GenerateSyncCommand_QAA_NXZ_829F9C98) {
+  const uint32_t controller = ctx.r3.u32;
+  __imp__rex_Sk8_SimController_GenerateSyncCommand_QAA_NXZ_829F9C98(ctx, base);
+  if ((ctx.r3.u32 & 0xFF) == 0) {
+    return;
+  }
+  ::sk83_guest_profiler::NoteSimTick();  // sim tick boundary (main thread)
+  const double now = SimTickNow();
+  if (now < skate3::native_scene::g_camsig_deadline.load(std::memory_order_relaxed)) {
+    skate3::native_scene::CamSigPushTick(now, 4, REX_LOAD_U32(controller + 20), 0.0f, 0.0f);
+  }
+}
+
+// ---- Tick timing trace (diagnostic) -----------------------------------------
+// sk83_tick_trace = seconds to record into the camera-signal CSV, starting
+// sk83_tick_trace_delay seconds after the first rendered frame (unattended
+// runs). Adds kind 8 = the main loop woke from XBox2ExecutionMan::Wait (the
+// timer thread's per-period signal), next to kind 4 (sim tick started) and
+// kind 7 (sim frame stored).
+REXCVAR_DEFINE_DOUBLE(sk83_tick_trace, 0.0, "Skate 3",
+                      "DIAGNOSTIC: record N seconds of sim tick timing (main wake / tick start / "
+                      "frame stored / clock) into logs/cam_signal_*.csv");
+REXCVAR_DEFINE_DOUBLE(sk83_tick_trace_delay, 45.0, "Skate 3",
+                      "Seconds after the first frame before sk83_tick_trace starts");
+
+namespace skate3::native_scene {
+void MaybeStartTickTrace(double now) {
+  static double s_first = 0.0;
+  static bool s_done = false;
+  const double secs = REXCVAR_GET(sk83_tick_trace);
+  if (s_done || secs <= 0.0) return;
+  if (s_first == 0.0) s_first = now;
+  if (now - s_first >= REXCVAR_GET(sk83_tick_trace_delay)) {
+    s_done = true;
+    RecordCameraSignal(secs);
+  }
+}
+}  // namespace skate3::native_scene
+
+extern "C" REX_FUNC(rex_XBox2ExecutionMan_Wait_UAAXXZ_82B28D58) {
+  __imp__rex_XBox2ExecutionMan_Wait_UAAXXZ_82B28D58(ctx, base);
+  const double now = SimTickNow();
+  if (now < skate3::native_scene::g_camsig_deadline.load(std::memory_order_relaxed)) {
+    skate3::native_scene::CamSigPushTick(now, 8, 0, 0.0f, 0.0f);
+  }
+}

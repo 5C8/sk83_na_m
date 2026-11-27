@@ -4,8 +4,8 @@
 // CMake). Keep the numbers in step with project(... VERSION) in
 // CMakeLists.txt, which also feeds the window title.
 1 VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Skate3Recomp project"
             VALUE "FileDescription", "Skate3Recomp"
-            VALUE "FileVersion", "1.0.0"
+            VALUE "FileVersion", "1.1.0"
             VALUE "InternalName", "sk83_na_m"
             VALUE "LegalCopyright", "(c) Skate3Recomp contributors"
             VALUE "OriginalFilename", "sk83_na_m.exe"
             VALUE "ProductName", "Skate3Recomp"
-            VALUE "ProductVersion", "1.0.0"
+            VALUE "ProductVersion", "1.1.0"
             VALUE "Comments", "Fan-made recompilation. Not affiliated with or endorsed by Electronic Arts."
         END
     END

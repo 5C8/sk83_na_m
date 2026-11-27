@@ -620,6 +620,13 @@ inline FlatSet<uint64_t> g_frame_ws_keys;
 // from the native map (g_palette_mutex).
 inline std::unordered_map<uint64_t, std::vector<DrawEntry>> g_frame_ws_entries;
 inline uint32_t g_frame_ws_draws = 0;
+// Inside the world-shade pass's render function (sub_8297B5B0) and whether
+// one of its draws has been recognized as a world-shade draw (OnDrawDone);
+// from then on its remaining meshes skip the guest D3D draws and are
+// recorded directly (WorldShadeMeshDirect). Guest render thread only.
+inline int g_ws_pass_depth = 0;
+inline bool g_ws_pass_confirmed = false;
+inline std::atomic<uint64_t> g_ws_direct_meshes{0};
 // The MeshContexts the game's world-shade pass renders this frame (see
 // OnWorldShadowRender). Guarded by g_palette_mutex.
 inline std::vector<uint32_t> g_frame_ws_ctxs;

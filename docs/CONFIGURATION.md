@@ -6,6 +6,52 @@ constraints and availability still apply. SDK-level settings are additional.
 
 | Setting | Type / source default | Description |
 | --- | --- | --- |
+| `sk83_anim_split_fetch` | bool: `true` | Split the big animation fetch (all pedestrians in one Vector_ExtractPackedNVBR call) between the calling job thread and helper threads on the unused codec slot 4 |
+| `sk83_anim_split_prewake_us` | int32: `0` | How long the fetch-split helpers spin after the living-world job starts (us) before sleeping |
+| `sk83_anim_split_spin_us` | int32: `0` | How long the fetch-split helpers keep spinning after each split fetch (us) before sleeping (spinning costs the render thread more than it saves) |
+| `sk83_anim_split_verify` | bool: `false` | DIAGNOSTIC: re-run every split fetch unsplit and compare the decoded bones (logs counts) |
+| `sk83_anim_split_ways` | int32: `6` | How many parts sk83_anim_split_fetch cuts the big animation fetch into (2-4) |
+| `sk83_anim_twoconsec_cross` | bool: `true` | Native DecompressTwoConsecFrames for block-crossing frame pairs too. |
+| `sk83_anim_twoconsec_cross_verify` | bool: `false` | DIAGNOSTIC: run block-crossing DecompressTwoConsecFrames both ways and compare. |
+| `sk83_anim_twoconsec_verify_all` | bool: `false` | DIAGNOSTIC: also verify in-block DecompressTwoConsecFrames calls (with _cross_verify). |
+| `sk83_audio_thread` | bool: `true` | Run the render loop's AudioSystem::Update on its own guest thread, overlapping the frame's rendering (joined at the end of the frame). |
+| `sk83_capture_count` | int32: `6` | DIAGNOSTIC: snapshots to take |
+| `sk83_capture_delay` | double: `60.0` | DIAGNOSTIC: seconds after start before the first snapshot |
+| `sk83_capture_dir` | string: `""` | DIAGNOSTIC: directory for guest-state snapshots (capture) |
+| `sk83_capture_every` | int32: `500` | DIAGNOSTIC: take a snapshot every this many calls of the capture point |
+| `sk83_capture_fn` | string: `""` | DIAGNOSTIC: hex address of the capture point to snapshot (e.g. 829A77B8) |
+| `sk83_cull_jobs_job_threads_only` | bool: `true` | Scene culling jobs run on the job threads only, never inside an animation wait (keeps them off the living-world job's critical path). |
+| `sk83_guest_profile` | double: `0.0` | DIAGNOSTIC: sample the guest render thread for this many seconds (re-arms when the value changes); report in logs/guestprof_<ts>.txt |
+| `sk83_guest_profile_delay` | double: `0.0` | DIAGNOSTIC: start the armed guest profile this many seconds later (e.g. arm it from the command line, sample once gameplay runs) |
+| `sk83_guest_profile_main` | bool: `false` | DIAGNOSTIC: the next guest profile samples the main (sim) thread instead (frames = sim ticks; report in logs/mainprof_<ts>.txt) |
+| `sk83_guest_profile_thread` | string: `""` | DIAGNOSTIC: sample the thread whose name contains this instead (frames still come from the render/main thread), e.g. 'Job Thread' |
+| `sk83_guest_profile_thread_index` | int32: `0` | DIAGNOSTIC: which match of sk83_guest_profile_thread (0 = first) |
+| `sk83_job_addevent_fix` | bool: `true` | Fix the EA::Jobs lost-release race at its source: LocalBackend::AddEvent treated only state 3 (done) as finished, not state 4 (the garbage collector's 'collecting', which keeps the job id and runs JobInstance::Clear -- resetting the played flags and event lists -- under the list lock). An event registered then was appended to a dead list and never played (the freeze). Native AddEvent, identical except that 3 and 4 both count as finished |
+| `sk83_job_release_repair` | bool: `true` | Safety net for the EA::Jobs lost-release freeze: a job stuck not-ready for 1 s with its enabler counter at 1 while every dependency it registered on has finished gets the release its lost event would have done (logged as '[job-watch] REPAIRED') |
+| `sk83_job_timeline` | int32: `0` | DIAGNOSTIC: record a job timeline for this many render frames (logs/jobtimeline_<ts>.txt) |
+| `sk83_job_timeline_delay` | double: `60.0` | DIAGNOSTIC: seconds after start before the job timeline records |
+| `sk83_job_watch_inject` | int32: `0` | TEST ONLY: N > 0 = once, N seconds after the watch arms, make one job lose a dependency release (an extra count on its enabler counter at AddEvent) to exercise the diagnosis + repair path |
+| `sk83_native_anim` | bool: `true` | Run decompiled animation job functions (PoseWithMatMult, ACSsqtBlend_job, the Andale fetch Vector_ExtractPackedNVBR) as native code instead of the recompiled ones. Same results bit for bit; faster |
+| `sk83_native_anim_header` | bool: `true` | Native ANIM_CODEC VBRDecompressor InitPerAnim / UnPackHeaderBits (bit-exact). |
+| `sk83_native_anim_header_verify` | bool: `false` | DIAGNOSTIC: run the recompiled InitPerAnim too and compare every written byte. |
+| `sk83_native_collision` | bool: `true` | Run decompiled collision functions (UnitGetOverlappingGPInstances) as native code instead of the recompiled ones. Same results bit for bit; faster |
+| `sk83_native_csis_lock` | bool: `true` | Take the audio library's (Csis) guest mutex with a host critical section instead of kernel mutex calls (read once at the first lock) |
+| `sk83_native_physics` | bool: `true` | Run the physics solver job (rw::physics: island tables, contact/joint/drive compilers, Horus iterations, dynamic update, spies) as native decompiled code instead of the recompiled functions. Same results bit for bit; faster |
+| `sk83_native_physics_skip` | string: `""` | Stages that stay recompiled while sk83_native_physics is on, comma-separated: islands,contacts,joints,drives,iter,iter-island,integrate,spy-c,spy-j,spy-d (or all) |
+| `sk83_native_physics_stats` | bool: `true` | Log per-stage physics solver times every 10 s (both modes) |
+| `sk83_native_physics_verify` | bool: `false` | DIAGNOSTIC: run the contact/joint/drive compilers both ways on the same input and log any difference ('physics verify' lines); the native result is kept |
+| `sk83_native_render_game` | bool: `true` | Run the decompiled render-thread game functions natively (verified with --sk83_replay); off = the recompiled ones |
+| `sk83_native_runsinglejob` | bool: `true` | Native EA::Jobs LocalBackend::RunSingleJob (the job pick of every job thread and job waiter). |
+| `sk83_native_runsinglejob_selftest` | bool: `false` | DIAGNOSTIC: the verify fixture runs the recompiled function on both copies. |
+| `sk83_native_runsinglejob_verify` | bool: `false` | DIAGNOSTIC: every 64th call, run the recompiled and the native RunSingleJob on two private copies of the live slot array and compare. |
+| `sk83_precise_sim_timer` | bool: `true` | Pace the sim tick timer on an exact 60 Hz host line (lower, steadier input latency with the even presentation clock) |
+| `sk83_present_clock` | bool: `true` | Even presentation clock: interpolate sim frames on a continuous clock whose delay is measured from frame arrival times (instead of the guest's jump-to-newest + stalling alpha). With the native smooth camera off it still blends frames itself |
+| `sk83_present_clock_late_pct` | double: `0.5` | Share of sim frames (percent) allowed to arrive after they are due on screen (each one is a short hold). The clock measures arrival timing and sets the smallest delay that meets this. Lower = fewer holds, more delay |
+| `sk83_replay` | string: `""` | DIAGNOSTIC: replay the snapshots in this directory at the first Swap, compare decomp off/on, write replay_report.txt and exit |
+| `sk83_replay_selftest` | bool: `false` | DIAGNOSTIC: replay runs the reference twice (determinism check) |
+| `sk83_streamer_swap_fix` | bool: `true` | Defer deleting a replaced streamer controller (fixes a load-time race crash) |
+| `sk83_tick_trace` | double: `0.0` | DIAGNOSTIC: record N seconds of sim tick timing (main wake / tick start / frame stored / clock) into logs/cam_signal_*.csv |
+| `sk83_tick_trace_delay` | double: `45.0` | Seconds after the first frame before sk83_tick_trace starts |
 | `skate3_apt_probe` | bool: `false` | Log each APT render item (depth <= 7) when first pushed and whenever its world x changes |
 | `skate3_apt_spread` | bool: `true` | Wide outputs: move the 16:9 HUD's elements out toward the screen edges (unscaled) instead of keeping the whole HUD in a centered band |
 | `skate3_apt_spread_all` | bool: `false` | Spread every 1280x720 APT screen (menus too), not only the HUD movies |
@@ -158,6 +204,8 @@ constraints and availability still apply. SDK-level settings are additional.
 | `skate3_native_render_scene_showcase_order` | string: `skate3::native_scene::kShowcaseOrderDefault` | Showcase layer order: comma-separated reveal steps, '+' joins layers into one wipe, a '-' prefix disables a layer while keeping its position. Tokens: albedo, lighting, materials, decals, dyn, shadows, ao, ssr, vol, bloom (the run always starts from clay geometry, and a final full-render step is appended when the list leaves layers unrevealed). decals (graffiti/paint art + macro weathering; renders on the full material look, so place it after materials) and dyn (dynamic entities: characters, props, cloth) HIDE their content until revealed; left out or disabled, that content renders from clay onward as usual. The CSM atlas is shared by both sides of the split, so a dyn step AFTER shadows shows entity shadows before their owners; order dyn first. Example: "albedo,lighting,materials,decals,dyn,shadows+ao". |
 | `skate3_native_render_scene_showcase_wipe` | double: `3.0` | Showcase: seconds each split wipe takes to cross the screen. |
 | `skate3_native_render_scene_simpledraw` | bool: `true` | Replay the game's SimpleDraw debug primitives (simpledraw_* shaders: e.g. the cv_ShowRenderSkeleton bone lines) in the native scene |
+| `skate3_native_render_scene_skip_guest_static` | bool: `true` | Skip the GUEST engine's draw dispatch (material setup, D3D calls, our draw hook) for plain static world items in the main view whose native item was built completely from cache last frame. They still go through on their islands' staggered 1-in-32 render-state refresh frames; anything dynamic, skinned, decal / traffic / water / ad / transparent, or with a game render test always goes through. |
+| `skate3_native_render_scene_skip_guest_zprepass` | bool: `true` | Skip the GUEST engine's depth-only z-prepass of the main camera view while the native renderer is drawing the world. The pass only fills the emulated GPU's depth buffer, which nothing shows in native mode; in Downtown it is ~7% of the guest render thread (traversal, D3D calls, our draw hook). Other views and emulated mode keep it. PrepZPrePass (mesh camera distances) still runs. |
 | `skate3_native_render_scene_smooth_camera` | bool: `true` | Re-time the camera on the host clock: the guest publishes new camera poses on its own sim tick (~170-240 Hz, irregular: measured streaks of 10 rendered frames on one pose at 400 fps), which reads as the world juddering/skipping while panning. Interpolates between the last two distinct guest poses, one sim-interval behind (a few ms of added camera latency, no overshoot). Teleports/cuts snap. |
 | `skate3_native_render_scene_smooth_camera_filter_ms` | double: `50.0` | Boxcar filter window (ms) applied to the smoothed camera pose, centered on the playback point. The game's camera pose VALUES advance in 60 Hz-quantized lumps at high render rates (measured: +-2.2 deg off a constant-rate stick pan, velocity CV 0.84); 50 ms = three 60 Hz periods nulls the quantization at any render rate (measured 185 -> 7 deg/s rms frame-to-frame velocity jitter) for ~25 ms extra camera latency. 0 = off (raw sample interpolation). |
 | `skate3_native_render_scene_sort_opaque` | bool: `true` | Draw opaque scene items front-to-back (bbox-center camera distance). Early-z rejects occluded pixels before the heavy material shading runs; the game's own sort order is by render state, not depth. |
@@ -173,6 +221,9 @@ constraints and availability still apply. SDK-level settings are additional.
 | `skate3_native_render_scene_ssr_intensity` | double: `1.0` | SSR composite strength over the material's cube reflection term (0 = effectively off). |
 | `skate3_native_render_scene_ssr_steps` | int32: `48` | SSR screen-space march taps per ray (half-res pass). More taps resolve thinner reflected geometry at proportional GPU cost. |
 | `skate3_native_render_scene_ssr_thickness` | double: `1.0` | SSR depth thickness (view units): how deep behind a visible surface a marching ray still counts as a hit. Too small and rays tunnel through thin ledges/rails; too large and reflections smear under overhangs. |
+| `skate3_native_render_scene_static_persist` | bool: `true` | Keep static scenery items alive between frames: a static-skip world item is built once with ALL of its mesh's islands (spatial pieces; the native renderer culls the item itself) and reused while its MeshContext keeps the same record, no hook reported its buffers or mesh touched, and its staggered 32-frame rebuild is not due. Removes the per-frame guest-memory walk of static records |
+| `skate3_native_render_scene_static_persist_more` | bool: `true` | Static persistence also covers tree / animated-tree / proxyworld items: built once and reused like the static skip set, but the guest keeps drawing them (their frame-global rows come from those draws). OFF = rebuilt every frame. |
+| `skate3_native_render_scene_static_persist_verify` | bool: `false` | DIAGNOSTIC: rebuild every reused persistent item and compare ('static persist' log line) |
 | `skate3_native_render_scene_stretch_guard` | bool: `true` | Draw-time stretch veto: skin cached sample verts of each skinned mesh's GPU-resident decode with the final palette every frame; wider than bind size = the 1-frame mangled-ribbon flash; skip the item's draws (blink) |
 | `skate3_native_render_scene_stretch_guard_dump` | bool: `false` | On a stretch veto, dump the full bone palette and probe verts to logs/stretch_*.txt (first 6 trips) for offline diagnosis of which rows are junk |
 | `skate3_native_render_scene_sun_azimuth` | double: `220.0` | Overridden sun azimuth in degrees (compass heading the sun sits toward; 0 = +Z north, 90 = +X east). |
@@ -191,6 +242,7 @@ constraints and availability still apply. SDK-level settings are additional.
 | `skate3_native_render_scene_world_items` | bool: `true` | Publish world sort-list items (static geometry) |
 | `skate3_native_render_scene_world_v2` | bool: `true` | World-shading v2: per-pixel normal/detail/spec maps on the exact environment families (the game's own GetTangentLight kd + phong terms; v1 folded them to the flat-map constants). Off = the v1 flat response, for A/B comparison. |
 | `skate3_native_render_scene_world_v2_tan_sign` | double: `1.0` | World-shading v2: polarity relating the stored frame's cross(binormal, normal) x handedness to the game's tangent (+1/-1). Calibrated against the emulated reference; flips the kd sun-direction response if wrong. |
+| `skate3_native_render_scene_ws_direct` | bool: `true` | World-shade pass: after its first draw identifies the pass, record the remaining caster meshes' shadow islands directly and skip their guest D3D draws (the native renderer re-renders the map from the records; the emulated draws are discarded anyway). OFF = every mesh goes through the guest draw path. |
 | `skate3_native_render_shader_dump_dir` | string: `""` | Dev: write every distinct guest shader's raw big-endian Xenos microcode to this directory as ps_/vs_<name>.bin (feed the same folder to skate3_disasm_ucode_dir to disassemble) |
 | `skate3_native_render_snapshot_all_draws` | bool: `false` | Record the draw stream on every recorded frame instead of 2 of every 60 (large .draws.bin; for targeted investigations) |
 | `skate3_native_render_snapshot_dir` | string: `"native_render_snapshots"` | Directory for native-render guest memory snapshots and metadata |

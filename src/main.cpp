@@ -1,6 +1,8 @@
 #include <string>
 #include <cstring>
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 // sk83_na_m - ReXGlue Recompiled Project
 //
@@ -196,7 +198,122 @@ extern "C" REX_FUNC(rex_xcore_FailAssert_YAXPBD0H_Z_82B58838) {
         }
         REXLOG_ERROR("[assert] Localizer: unregistered format type in text '{}'", text);
     }
+    rex::FlushLogging();
     __imp__rex_xcore_FailAssert_YAXPBD0H_Z_82B58838(ctx, base);
+}
+
+
+// DIAGNOSTIC: the CRT's _purecall. A load-time crash (2026-11-17) was a pure
+// virtual call from the app Render (sub_8283B3B0, call at 0x8283B6D4) on an
+// object fetched via AppMan[+64]->vfunc24. r3 still holds that object here,
+// so log it with its vtable (named via the .map) before the CRT aborts.
+extern "C" REX_FUNC(rex_purecall_83190B90) {
+    uint32_t obj = ctx.r3.u32;
+    uint32_t vt = (obj >= 0x10000u) ? REX_LOAD_U32(obj) : 0u;
+    uint32_t slot[8] = {};
+    if (vt >= 0x82000000u && vt < 0x84000000u) {
+        for (int i = 0; i < 8; ++i) slot[i] = REX_LOAD_U32(vt + 4u * i);
+    }
+    uint32_t app = REX_LOAD_U32(0x83367290u);
+    uint32_t app64 = app >= 0x10000u ? REX_LOAD_U32(app + 64u) : 0u;
+    uint32_t app64vt = app64 >= 0x10000u ? REX_LOAD_U32(app64) : 0u;
+    REXLOG_ERROR("[purecall] obj=0x{:08X} vtable=0x{:08X} lr=0x{:08X} r31=0x{:08X} | slots {:08X} {:08X} {:08X} {:08X} "
+                 "{:08X} {:08X} {:08X} {:08X} | app=0x{:08X} app+64=0x{:08X} (vt 0x{:08X})",
+                 obj, vt, uint32_t(ctx.lr), ctx.r31.u32, slot[0], slot[1], slot[2], slot[3], slot[4], slot[5],
+                 slot[6], slot[7], app, app64, app64vt);
+    rex::FlushLogging();
+    __imp__rex_purecall_83190B90(ctx, base);
+}
+
+// --- DataSysMan::SetStreamerController: deferred delete (game race) ---
+//
+// The game deletes the old streamer controller *before* publishing the new
+// one, with no sync against the render thread, which does
+// DataSysMan->m_streamer(+36)->UpdateStreamer() every frame (app Render,
+// sub_8283B3B0 at 0x8283B6D4). When the flow thread swaps controllers during
+// load, Render can fetch the old pointer and call into a dying object: pure
+// virtual call (vtable reset to the base) or an access violation once freed.
+// Rare on the 360; on PC under CPU load ~2% of loads crashed (2026-11-17).
+// Fix: publish the new pointer first, and run the old controller's deleting
+// destructor later, on the same thread that swapped it, after kDelay. No
+// render frame holds the pointer for anywhere near that long.
+REXCVAR_DEFINE_BOOL(sk83_streamer_swap_fix, true, "sk83",
+                    "Defer deleting a replaced streamer controller (fixes a load-time race crash)");
+namespace {
+struct RetiredStreamer {
+  uint32_t obj;
+  DWORD thread;
+  ULONGLONG when_ms;
+};
+std::mutex g_retired_mu;
+std::vector<RetiredStreamer> g_retired;
+std::atomic<uint32_t> g_retired_n{0};
+constexpr ULONGLONG kRetireDelayMs = 2000;
+
+void DrainRetiredStreamers(PPCContext& ctx, uint8_t* base, bool force) {
+  if (g_retired_n.load(std::memory_order_relaxed) == 0) return;
+  const DWORD me = GetCurrentThreadId();
+  const ULONGLONG now = GetTickCount64();
+  std::vector<uint32_t> due;
+  {
+    std::lock_guard<std::mutex> lock(g_retired_mu);
+    for (size_t i = 0; i < g_retired.size();) {
+      const ULONGLONG age = now - g_retired[i].when_ms;
+      // the swapping thread deletes after kRetireDelayMs; any thread after 5x
+      // (the first swap comes from a short-lived startup thread)
+      if (force || (g_retired[i].thread == me ? age >= kRetireDelayMs : age >= 5 * kRetireDelayMs)) {
+        due.push_back(g_retired[i].obj);
+        g_retired[i] = g_retired.back();
+        g_retired.pop_back();
+      } else {
+        ++i;
+      }
+    }
+    g_retired_n.store(uint32_t(g_retired.size()), std::memory_order_relaxed);
+  }
+  if (due.empty()) return;
+  const uint64_t r3 = ctx.r3.u64, r4 = ctx.r4.u64, lr = ctx.lr;
+  for (uint32_t obj : due) {
+    REXLOG_INFO("streamer swap fix: deleting retired controller 0x{:08X}", obj);
+    ctx.r3.u64 = obj;
+    ctx.r4.u64 = 1;  // deleting destructor: free the memory too
+    REX_CALL_INDIRECT_FUNC(REX_LOAD_U32(REX_LOAD_U32(obj)));
+  }
+  ctx.r3.u64 = r3;
+  ctx.r4.u64 = r4;
+  ctx.lr = lr;
+}
+}  // namespace
+
+extern "C" REX_FUNC(rex_Sk8_DataSysMan_SetStreamerController_UAAXPAVIStreamerController_2_Z_8289CD48) {
+  if (!REXCVAR_GET(sk83_streamer_swap_fix)) {
+    __imp__rex_Sk8_DataSysMan_SetStreamerController_UAAXPAVIStreamerController_2_Z_8289CD48(ctx, base);
+    return;
+  }
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t next = ctx.r4.u32;
+  const uint32_t old = REX_LOAD_U32(self + 36u);
+  if (next == old) return;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  REX_STORE_U32(self + 36u, next);  // publish first
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (old != 0) {
+    std::lock_guard<std::mutex> lock(g_retired_mu);
+    g_retired.push_back({old, GetCurrentThreadId(), GetTickCount64()});
+    REXLOG_INFO("streamer swap fix: 0x{:08X} -> 0x{:08X}, old one retired", old, next);
+    g_retired_n.store(uint32_t(g_retired.size()), std::memory_order_relaxed);
+  }
+}
+
+// The flow thread that swaps controllers calls GetDataSysMan regularly, so
+// retired controllers are deleted from here once their delay has passed.
+extern "C" REX_FUNC(rex_Sk8_Sk8AppMan_GetDataSysMan_QBAAAVDataSysMan_2_XZ_82832528) {
+  __imp__rex_Sk8_Sk8AppMan_GetDataSysMan_QBAAAVDataSysMan_2_XZ_82832528(ctx, base);
+  if (g_retired_n.load(std::memory_order_relaxed) != 0) {
+    const uint32_t r3 = ctx.r3.u32;
+    DrainRetiredStreamers(ctx, base, false);
+    ctx.r3.u64 = r3;
+  }
 }
 
 // --- rex_DebugBreak_82DAD568: log-and-halt ---
@@ -363,6 +480,57 @@ void Sk83InstallSoftAsserts() {
     REXLOG_WARN("Soft asserts: rexruntime module not found");
     return;
   }
+  // Breakpoint diagnostics: the SDK ends guest DbgBreakPoint / RtlRaiseException /
+  // KeBugCheck in rex::debug::Break(); without a debugger that kills the process with
+  // nothing in the (buffered) log. Log the host return-address chain (module+offset,
+  // resolve with llvm-symbolizer and the PDBs) and flush first; the crash proceeds.
+  struct Chain {
+    static std::string Of(const void* fault) {
+      void* frames[48] = {};
+      const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+      std::string chain = " fault=" + Name(fault) + " |";
+      for (USHORT i = 0; i < n; ++i) chain += " " + Name(frames[i]);
+      return chain;
+    }
+    static std::string Name(const void* p) {
+      HMODULE mod = nullptr;
+      char name[MAX_PATH] = "?";
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(p), &mod) &&
+          mod != nullptr) {
+        GetModuleFileNameA(mod, name, MAX_PATH);
+      }
+      const char* leaf = std::strrchr(name, 0x5C);  // last path separator
+      char item[160];
+      std::snprintf(item, sizeof(item), "%s+0x%llX", leaf ? leaf + 1 : name,
+                    (unsigned long long)(reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(mod)));
+      return item;
+    }
+  };
+  AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) {
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
+    REXLOG_CRITICAL("[breakpoint] host break at {} | chain:{}", ep->ExceptionRecord->ExceptionAddress,
+                    Chain::Of(ep->ExceptionRecord->ExceptionAddress));
+    rex::FlushLogging();
+    return EXCEPTION_CONTINUE_SEARCH;
+  });
+  // Unhandled crashes (access violations etc.) died silently: first-chance AVs
+  // can be legitimate (the runtime handles some), so log only at the
+  // unhandled-filter stage, then hand on to whatever filter was there.
+  static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = nullptr;
+  s_prev_filter = SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    REXLOG_CRITICAL("[crash] unhandled 0x{:08X} at {} (access {} 0x{:X}) | chain:{}",
+                    uint32_t(er->ExceptionCode), er->ExceptionAddress,
+                    er->NumberParameters >= 2 ? er->ExceptionInformation[0] : 0,
+                    er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0,
+                    Chain::Of(er->ExceptionAddress));
+    rex::FlushLogging();
+    return s_prev_filter ? s_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+  });
   REXLOG_INFO("Soft asserts: {}",
               PatchImportedWassert(m)
                   ? "SDK assert() is now non-fatal (logged, execution continues)"

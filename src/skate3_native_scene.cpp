@@ -723,6 +723,19 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
                     "casting it painted a hard brim band across the editor face). "
                     "OFF = every published character piece casts (old behavior).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_static_persist_more, true, "Skate 3",
+                    "Static persistence also covers tree / animated-tree / proxyworld "
+                    "items: built once and reused like the static skip set, but the "
+                    "guest keeps drawing them (their frame-global rows come from those "
+                    "draws). OFF = rebuilt every frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ws_direct, true, "Skate 3",
+                    "World-shade pass: after its first draw identifies the pass, record "
+                    "the remaining caster meshes' shadow islands directly and skip their "
+                    "guest D3D draws (the native renderer re-renders the map from the "
+                    "records; the emulated draws are discarded anyway). OFF = every "
+                    "mesh goes through the guest draw path.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // OFF by default: a native addition the game does not have. World surfaces
 // never sample it (their static shade is baked into the lightmaps, matching
 // the game), and characters/props sample the game's own natively
@@ -1288,6 +1301,29 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_build, true,
                     "skate3_native_render_scene_occlusion_cull.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_static_persist, true, "Skate 3",
+                    "Keep static scenery items alive between frames: a static-skip world item is "
+                    "built once with ALL of its mesh's islands (spatial pieces; the native renderer "
+                    "culls the item itself) and reused while its MeshContext keeps the same record, "
+                    "no hook reported its buffers or mesh touched, and its staggered 32-frame "
+                    "rebuild is not due. Removes the per-frame guest-memory walk of static records");
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_static_persist_verify, false, "Skate 3",
+                    "DIAGNOSTIC: rebuild every reused persistent item and compare ('static persist' "
+                    "log line)");
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_skip_guest_static, true, "Skate 3",
+                    "Skip the GUEST engine's draw dispatch (material setup, D3D calls, our draw "
+                    "hook) for plain static world items in the main view whose native item was "
+                    "built completely from cache last frame. They still go through on their "
+                    "islands' staggered 1-in-32 render-state refresh frames; anything dynamic, "
+                    "skinned, decal / traffic / water / ad / transparent, or with a game render "
+                    "test always goes through.");
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_skip_guest_zprepass, true, "Skate 3",
+                    "Skip the GUEST engine's depth-only z-prepass of the main camera view "
+                    "while the native renderer is drawing the world. The pass only fills the "
+                    "emulated GPU's depth buffer, which nothing shows in native mode; in "
+                    "Downtown it is ~7% of the guest render thread (traversal, D3D calls, our "
+                    "draw hook). Other views and emulated mode keep it. PrepZPrePass (mesh "
+                    "camera distances) still runs.");
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_guest, true,
                     "Skate 3",
                     "Also skip the GUEST engine's draw-list dispatch for "
@@ -2876,16 +2912,61 @@ struct CachedItemCore {
 std::mutex g_item_cache_mutex;
 PooledFlatMap<uint32_t, CachedItemCore> g_item_cache;
 
+// ---- Touch events (buffer write paths, mesh re-registration) ----------------
+// Any thread queues the touched guest object (D3D/renderengine vertex or index
+// buffer, or a re-registered mesh; hooks in src/native/sk83_buffer_events.cpp);
+// the render thread drains the queue at frame start into object -> guest frame.
+// Persistent static items rebuild when one of their objects was touched after
+// they were built.
+std::mutex g_touch_mutex;
+std::vector<uint32_t> g_touch_pending;
+bool g_touch_all = false;                     // lost events / cache cleared
+FlatMap<uint32_t, uint64_t> g_touch_frame;    // render thread
+uint64_t g_touch_all_frame = 0;               // render thread
+uint64_t g_touch_events = 0;                  // render thread (stats)
+
+void NoteTouched(uint32_t obj) {
+  if (obj == 0) return;
+  std::lock_guard<std::mutex> lock(g_touch_mutex);
+  if (g_touch_pending.size() < 65536) {
+    g_touch_pending.push_back(obj);
+  } else {
+    g_touch_all = true;
+  }
+}
+void NoteTouchedAll() {
+  std::lock_guard<std::mutex> lock(g_touch_mutex);
+  g_touch_all = true;
+}
+bool TouchedSince(uint32_t obj, uint64_t since) {
+  if (g_touch_all_frame >= since) return true;
+  const uint64_t* f = g_touch_frame.find(obj);
+  return f != nullptr && *f >= since;
+}
+
 void InvalidateCachedItem(uint32_t mesh) {
-  std::lock_guard<std::mutex> lock(g_item_cache_mutex);
-  g_item_cache.erase(mesh);
+  {
+    std::lock_guard<std::mutex> lock(g_item_cache_mutex);
+    g_item_cache.erase(mesh);
+  }
+  NoteTouched(mesh);
 }
 
 }  // namespace
+// Bumped when the item cache is cleared (menus / loading flip, mesh-cache
+// flush): shader objects of the old level may be freed and their addresses
+// reused, so every memo table empties itself on its next use.
+std::atomic<uint32_t> g_shader_memo_epoch{0};
 void ClearItemCache() {
-  std::lock_guard<std::mutex> lock(g_item_cache_mutex);
-  g_item_cache.clear();
+  {
+    std::lock_guard<std::mutex> lock(g_item_cache_mutex);
+    g_item_cache.clear();
+  }
+  NoteTouchedAll();
+  g_shader_memo_epoch.fetch_add(1, std::memory_order_relaxed);
 }
+
+void NoteBufferDirty(uint32_t obj) { NoteTouched(obj); }
 
 namespace {
 
@@ -3358,6 +3439,16 @@ bool PhotoCardVisible() {
 //
 // The offset is confirmed by content rather than trusted from the type word:
 // a real entry is a printable path carrying the .up debug suffix.
+// Per-shader-object memo tables (shader path, family / flag classifiers):
+// 4096 direct-mapped slots under a multiplicative hash. They used to be 256
+// slots indexed by low address bits, and shader objects allocated at large
+// alignment share those bits: a frame's few hundred VS/PS objects evicted
+// each other, and every miss re-copied a 320-byte shader path out of guest
+// memory and re-ran its strstr chain on the draw hook.
+constexpr uint32_t kShaderMemoSlots = 4096;
+inline uint32_t ShaderMemoSlot(uint32_t obj) { return (obj * 0x9E3779B1u) >> 20; }
+#define SHADER_MEMO_EPOCH_CHECK(table)                                                do {                                                                                  static thread_local uint32_t s_memo_ep = 0;                                         const uint32_t ep_now = g_shader_memo_epoch.load(std::memory_order_relaxed);        if (s_memo_ep != ep_now) {                                                            s_memo_ep = ep_now;                                                                 std::memset(table, 0, sizeof(table));                                             }                                                                                 } while (0)
+
 uint32_t ShaderPathAddr(uint8_t* base, uint32_t obj) {
   if (obj < 0x10000) {
     return obj + 0x54;
@@ -3370,8 +3461,9 @@ uint32_t ShaderPathAddr(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     uint32_t addr;
   };
-  static thread_local PathMemo memo[256] = {};
-  PathMemo& slot = memo[(obj >> 4) & 0xFFu];
+  static thread_local PathMemo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  PathMemo& slot = memo[ShaderMemoSlot(obj)];
   if (slot.obj == obj) {
     return slot.addr;
   }
@@ -3397,7 +3489,7 @@ int ClassifyPfxShader(uint8_t* base, uint32_t obj) {
   if (obj == 0 || !GuestReadableApprox(base, obj)) {
     return -1;
   }
-  static std::unordered_map<uint32_t, int> cache;
+  static ObjClassCache<int> cache;
   auto it = cache.find(obj);
   if (it != cache.end()) {
     return it->second;
@@ -3696,7 +3788,7 @@ bool IsCasEditorPs(uint8_t* base, uint32_t obj) {
   if (obj < 0x10000) {
     return false;
   }
-  static std::unordered_map<uint32_t, bool> cache;
+  static ObjClassCache<bool> cache;
   auto it = cache.find(obj);
   if (it != cache.end()) {
     return it->second;
@@ -3737,7 +3829,7 @@ bool IsCasEditorPs(uint8_t* base, uint32_t obj) {
 // later than dynamicobject_defaultPS for the material multiplier / ambient /
 // bounce (see the dynobj row capture). Guest render thread only.
 bool BoundAlphatestDynobjPs(uint8_t* base) {
-  static std::unordered_map<uint32_t, bool> cache;
+  static ObjClassCache<bool> cache;
   const auto classify = [&](uint32_t obj) -> bool {
     if (obj < 0x10000) {
       return false;
@@ -3765,7 +3857,7 @@ bool BoundAlphatestDynobjPs(uint8_t* base) {
 }
 
 int NisDefaultCharacterPsKind(uint8_t* base) {
-  static std::unordered_map<uint32_t, int> cache;
+  static ObjClassCache<int> cache;
   const auto classify = [&](uint32_t obj) -> int {
     if (obj < 0x10000) {
       return 0;
@@ -5390,6 +5482,79 @@ void OnWorldShadowRender(uint8_t* base, uint32_t owner) {
   }
 }
 
+void BeginWorldShadowPass() {
+  ++g_ws_pass_depth;
+  g_ws_pass_confirmed = false;
+}
+
+void EndWorldShadowPass() {
+  if (g_ws_pass_depth > 0) {
+    --g_ws_pass_depth;
+  }
+  g_ws_pass_confirmed = false;
+}
+
+bool WorldShadeMeshDirect(uint8_t* base, uint32_t mc) {
+  if (g_ws_pass_depth <= 0 || !g_ws_pass_confirmed || !SceneEnabled() ||
+      !REXCVAR_GET(skate3_native_render_scene_ws_direct) ||
+      g_recording.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  GuestReadRecoveryScope guest_read_recovery(base);
+  // RenderShadowMesh's own reads (decomp renderview.cpp): mesh = **mc,
+  // buffers at mesh +0x30 / +0x34, the shadow island selection at mc +0x28
+  // (count) / +0x38 (indices) into the island table at mc +0x3C.
+  uint32_t ref = 0, mesh = 0, ib = 0, vb = 0, n = 0, sel = 0, arr = 0;
+  if (!GuestTryLoadU32(base, mc, &ref) || !GuestTryLoadU32(base, ref, &mesh) ||
+      !GuestTryLoadU32(base, mesh + kMeshIndexBuffer, &ib) ||
+      !GuestTryLoadU32(base, mesh + kMeshVertexBuffer, &vb) ||
+      !GuestTryLoadU32(base, mc + 0x28, &n) || n > 4096) {
+    return false;
+  }
+  if (n == 0) {
+    return true;  // the game draws nothing for it either
+  }
+  if (!GuestTryLoadU32(base, mc + 0x38, &sel) || !GuestTryLoadU32(base, mc + kCtxDrawArray, &arr) ||
+      !GuestReadableApprox(base, sel) || !GuestReadableApprox(base, sel + (n - 1) * 4) ||
+      !GuestReadableApprox(base, arr)) {
+    return false;
+  }
+  const uint64_t key = (uint64_t(ib) << 32) | vb;
+  std::lock_guard<std::mutex> lock(g_palette_mutex);
+  // Exactly what OnDrawDone records for each of these draws (the pass's
+  // rows and bank were taken from its first, really drawn, mesh).
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t island = 0;
+    if (!GuestTryLoadU32(base, sel + i * 4, &island)) {
+      continue;
+    }
+    const uint32_t d = arr + island * 16;
+    uint32_t w[4];
+    if (!GuestTryLoadU32(base, d, &w[0]) || !GuestTryLoadU32(base, d + 4, &w[1]) ||
+        !GuestTryLoadU32(base, d + 8, &w[2]) || !GuestTryLoadU32(base, d + 12, &w[3])) {
+      continue;
+    }
+    if (g_frame_ws_keys.size() < 8192) {
+      g_frame_ws_keys.insert(key);
+    }
+    if (w[3] != 0 && g_frame_ws_entries.size() < 8192) {
+      std::vector<DrawEntry>& ents = g_frame_ws_entries[key];
+      const DrawEntry e{w[0], w[1], w[2], w[3]};
+      bool dup = false;
+      for (const DrawEntry& x : ents) {
+        dup = dup || (x.prim == e.prim && x.base_vertex == e.base_vertex &&
+                      x.start_index == e.start_index && x.index_count == e.index_count);
+      }
+      if (!dup && ents.size() < 512) {
+        ents.push_back(e);
+      }
+    }
+    ++g_frame_ws_draws;
+  }
+  g_ws_direct_meshes.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
                              bool drew_inside) {
   if (!SceneEnabled()) {
@@ -5801,7 +5966,7 @@ uint32_t ClassifySplineShader(uint8_t* base, uint32_t obj) {
     return 0;
   }
   static std::mutex mu;
-  static std::unordered_map<uint32_t, uint32_t> cache;
+  static ObjClassCache<uint32_t> cache;
   std::lock_guard<std::mutex> lock(mu);
   auto it = cache.find(obj);
   if (it != cache.end()) {
@@ -5872,8 +6037,9 @@ uint32_t ShaderNameFlags(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     uint32_t bits;
   };
-  static thread_local Memo memo[256] = {};
-  Memo& m = memo[((obj >> 4) ^ (obj >> 12)) & 255u];
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  Memo& m = memo[ShaderMemoSlot(obj)];
   if (m.obj == obj) {
     return m.bits;
   }
@@ -5926,8 +6092,9 @@ uint32_t CharShaderFlagsOf(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     uint32_t bits;
   };
-  static thread_local Memo memo[256] = {};
-  Memo& m = memo[((obj >> 4) ^ (obj >> 12)) & 255u];
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  Memo& m = memo[ShaderMemoSlot(obj)];
   if (m.obj == obj) {
     return m.bits;
   }
@@ -5980,8 +6147,9 @@ bool SkateparkWorldPsOf(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     bool hit;
   };
-  static thread_local Memo memo[256] = {};
-  Memo& m = memo[((obj >> 4) ^ (obj >> 12)) & 255u];
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  Memo& m = memo[ShaderMemoSlot(obj)];
   if (m.obj == obj) {
     return m.hit;
   }
@@ -6026,8 +6194,9 @@ int WorldPsKindOf(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     int hit;
   };
-  static thread_local Memo memo[256] = {};
-  Memo& m = memo[((obj >> 4) ^ (obj >> 12)) & 255u];
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  Memo& m = memo[ShaderMemoSlot(obj)];
   if (m.obj == obj) {
     return m.hit;
   }
@@ -6066,11 +6235,12 @@ int CensusPsKind(uint8_t* base, uint32_t obj) {
     uint32_t obj;
     int kind;
   };
-  static thread_local Memo memo[512] = {};
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
   // Higher address bits folded in: shader objects allocated at a large
   // alignment share their low bits and would evict each other every draw
   // (each miss re-reads the shader path).
-  Memo& m = memo[((obj >> 4) ^ (obj >> 13)) & 511u];
+  Memo& m = memo[ShaderMemoSlot(obj)];
   if (m.obj == obj) {
     return m.kind;
   }
@@ -6107,8 +6277,9 @@ int ParkWorldRegOf(uint8_t* base, uint32_t obj, const char* variant) {
     const char* variant;
     int reg;
   };
-  static thread_local Memo memo[256] = {};
-  Memo& m = memo[((obj >> 4) ^ (uint32_t(reinterpret_cast<uintptr_t>(variant)) >> 3)) & 255u];
+  static thread_local Memo memo[kShaderMemoSlots] = {};
+  SHADER_MEMO_EPOCH_CHECK(memo);
+  Memo& m = memo[ShaderMemoSlot(obj ^ (uint32_t(reinterpret_cast<uintptr_t>(variant)) >> 3))];
   if (m.obj == obj && m.variant == variant) {
     return m.reg;
   }
@@ -6799,7 +6970,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
         return 0;
       }
-      static std::unordered_map<uint32_t, int> cache;
+      static ObjClassCache<int> cache;
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
@@ -6895,7 +7066,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
             return 0;
           }
-          static std::unordered_map<uint32_t, int> cache;
+          static ObjClassCache<int> cache;
           auto it = cache.find(obj);
           if (it != cache.end()) {
             return it->second;
@@ -7510,7 +7681,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
             return 0;
           }
-          static std::unordered_map<uint32_t, int> cache;
+          static ObjClassCache<int> cache;
           auto it = cache.find(obj);
           if (it != cache.end()) {
             return it->second;
@@ -7859,7 +8030,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
         return -1;
       }
-      static std::unordered_map<uint32_t, int> cache;
+      static ObjClassCache<int> cache;
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
@@ -7922,7 +8093,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
         return 0;
       }
-      static std::unordered_map<uint32_t, int> cache;
+      static ObjClassCache<int> cache;
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
@@ -8024,7 +8195,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         return false;
       }
       // Guest-render-thread only (like the fog capture globals).
-      static std::unordered_map<uint32_t, int> cache;  // 0 no, 1 plain, 2 masked
+      static ObjClassCache<int> cache;  // 0 no, 1 plain, 2 masked
       auto it = cache.find(obj);
       int kind = 0;
       if (it != cache.end()) {
@@ -8119,7 +8290,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (obj == 0 || !GuestReadableApprox(base, obj)) {
         return 0;
       }
-      static std::unordered_map<uint32_t, int> cache;
+      static ObjClassCache<int> cache;
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
@@ -8726,6 +8897,11 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     const float dy = LoadGuestF32(base, bank + (2 * 4 + 1) * 4);
     const float dz = LoadGuestF32(base, bank + (2 * 4 + 2) * 4);
     if (std::fabs(dx) < 1e-6f && std::fabs(dz) < 1e-6f && dy < 0.0f && dy > -0.005f) {
+      // Inside the pass's render function: its remaining meshes can be
+      // recorded straight from their island lists (see WorldShadeMeshDirect).
+      if (g_ws_pass_depth > 0) {
+        g_ws_pass_confirmed = true;
+      }
       if (g_frame_ws_keys.size() < 8192) {
         g_frame_ws_keys.insert(key);
       }
@@ -10092,6 +10268,42 @@ bool LoadingOrFrontendActive() {
 // pose rings with it instead of the frame time avoids the same aliasing.
 double g_latest_cam_tick = 0.0;
 
+}  // namespace skate3::native_scene (reopened below)
+namespace sk83_guest_profiler {
+void NoteFrame();  // sk83_guest_profiler.cpp
+}
+namespace sk83_present_clock {
+double ContentTime(double now);  // sk83_present_clock.cpp; -1 = clock not driving
+double ContentTime(double now, double* play);  // + the clock's playback host time
+double TickPeriod();  // current sim tick period (s)
+}
+namespace skate3::native_scene {
+
+// Pose filter width (seconds) for the camera and entity smoothers. The boxcar
+// exists to cancel the guest's 60 Hz-lumped pose values; the even
+// presentation clock removes those at the source and stamps poses with exact
+// content time, so the filter (and the lag it forces) is dropped while it
+// drives the frame.
+// Staleness window of the pose rings: 0.1 s at 60 Hz (and faster), three sim
+// ticks when the sim runs slower (slow motion / the sim-rate override), where
+// consecutive poses are legitimately further apart than 0.1 s.
+double StaleWindow() { return std::max(0.1, 3.0 * ::sk83_present_clock::TickPeriod()); }
+
+double SmoothFilterW(double now) {
+  if (::sk83_present_clock::ContentTime(now) >= 0.0) return 0.0;
+  return std::clamp(REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0,
+                    200.0) * 1e-3;
+}
+
+
+bool g_smooth_held = false;  // see FrameScene::smooth_held; guest render thread
+
+struct SmoothDiag {
+  double t0 = 0.0;
+  uint64_t calls = 0, no_content = 0, few = 0, stale = 0, pushed = 0, dup = 0;
+  uint64_t snap_stale = 0, snap_dist = 0, snap_rot = 0;
+};
+SmoothDiag g_smooth_diag;  // guest render thread only
 
 bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp[16],
                   const float raw_cam[3], double now, float vp_out[16],
@@ -10116,7 +10328,12 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     const float dx = p.c[0] - latest.c[0], dy = p.c[1] - latest.c[1],
                 dz = p.c[2] - latest.c[2];
     const float dist2 = dx * dx + dy * dy + dz * dz;
-    if (s_count == 0 || p.t - latest.t > 0.1 || dist2 > 25.0f || dot < 0.9f) {
+    if (s_count == 0 || p.t - latest.t > StaleWindow() || dist2 > 25.0f || dot < 0.9f) {
+      if (s_count > 0) {
+        if (p.t - latest.t > StaleWindow()) ++g_smooth_diag.snap_stale;
+        else if (dist2 > 25.0f) ++g_smooth_diag.snap_dist;
+        else ++g_smooth_diag.snap_rot;
+      }
       // First sample / stale history / teleport / hard cut: snap.
       s_ring[0] = p;
       s_newest = 0;
@@ -10125,8 +10342,10 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     } else {
       const double dt = p.t - latest.t;
       if (dt <= 0.0) {
+        ++g_smooth_diag.dup;
         return;  // out-of-order/duplicate
       }
+      ++g_smooth_diag.pushed;
       if (dt > 0.0005 && dt < 0.05) {
         s_period = s_period * 0.9 + dt * 0.1;
       }
@@ -10137,10 +10356,46 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     g_latest_cam_tick = p.t;
   };
 
-  // Primary source: the ~1 kHz sampler thread (precise timestamps: pose
+  // Even presentation clock driving (sk83_present_clock): this frame's
+  // pose was computed at an exactly known content time, so it is stamped
+  // with that instead of a detection time; the sampler's host stamps carry
+  // the render loop's timing noise and are not used.
+  const double content_t = ::sk83_present_clock::ContentTime(now);
+  if (content_t >= 0.0) {
+    {
+      std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
+      g_cam_samples.clear();
+    }
+    if (std::memcmp(s_last_view, view, sizeof(s_last_view)) != 0) {
+      std::memcpy(s_last_view, view, sizeof(s_last_view));
+      CamPose p;
+      p.t = content_t;
+      QuatFromView(view, p.q);
+      std::memcpy(p.c, raw_cam, sizeof(p.c));
+      push_pose(p);
+    } else if (s_count > 0 && content_t > s_ring[s_newest].t + 0.0005) {
+      // Same pose, later content time: an exact sample of a pose that HELD
+      // (a static camera, or the frame re-stamped when the clock absorbed a
+      // late arrival). Without it the next pose would be interpolated from
+      // the old stamp: the hold would end in a jump. Built from the CURRENT
+      // view, not the ring's newest: a changed view whose push was dropped
+      // (same content time as the previous sample) is not in the ring, and
+      // re-stamping the older ring pose lost it for good (camera a frame
+      // behind until the next change).
+      CamPose p;
+      p.t = content_t;
+      QuatFromView(view, p.q);
+      std::memcpy(p.c, raw_cam, sizeof(p.c));
+      push_pose(p);
+    }
+    // Entities posed this frame share its content time (their rings read
+    // g_latest_cam_tick), whether or not the camera moved.
+    g_latest_cam_tick = content_t;
+  }
+  // Primary source otherwise: the ~1 kHz sampler thread (precise timestamps: pose
   // samples taken per RENDERED frame alias against the ~200 Hz sim tick as
   // soon as the render rate is paced down; see CamSamplerLoop).
-  {
+  if (content_t < 0.0) {
     static std::vector<RawCamSample> s_pending;
     {
       std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
@@ -10159,7 +10414,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     s_pending.clear();
   }
 
-  if (std::memcmp(s_last_view, view, sizeof(s_last_view)) != 0) {
+  if (content_t < 0.0 && std::memcmp(s_last_view, view, sizeof(s_last_view)) != 0) {
     std::memcpy(s_last_view, view, sizeof(s_last_view));
     CamPose p;
     p.t = now;
@@ -10190,7 +10445,26 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
       push_pose(p);
     }
   }
-  if (s_count < 3 || now - s_ring[s_newest].t > 0.1) {
+  // Why the smoother is (not) engaging, every 10 s (the content-clock lag
+  // report below is only reached on frames that pass this gate).
+  ++g_smooth_diag.calls;
+  if (content_t < 0.0) ++g_smooth_diag.no_content;
+  if (s_count < 3) ++g_smooth_diag.few;
+  else if (now - s_ring[s_newest].t > StaleWindow()) ++g_smooth_diag.stale;
+  if (now - g_smooth_diag.t0 > 10.0) {
+    if (g_smooth_diag.t0 > 0.0) {
+      REXLOG_INFO(
+          "native-scene smoother gate: {} calls, no-content {}, few-poses {}, stale {} "
+          "| pushed {} dup {} snaps stale/dist/rot {}/{}/{} | newest-now {:.1f} ms",
+          g_smooth_diag.calls, g_smooth_diag.no_content, g_smooth_diag.few,
+          g_smooth_diag.stale, g_smooth_diag.pushed, g_smooth_diag.dup,
+          g_smooth_diag.snap_stale, g_smooth_diag.snap_dist, g_smooth_diag.snap_rot,
+          s_count > 0 ? (s_ring[s_newest].t - now) * 1e3 : 0.0);
+    }
+    g_smooth_diag = {};
+    g_smooth_diag.t0 = now;
+  }
+  if (s_count < 3 || now - s_ring[s_newest].t > StaleWindow()) {
     s_play_valid = false;
     g_smooth_active = false;
     return false;
@@ -10203,21 +10477,45 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   s_last_now = now;
   // Boxcar pose filter (see below): the playback point must lag far enough
   // that the CENTERED window has ring samples on both sides.
-  const double filter_w = std::clamp(
-      REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
-      1e-3;
-  const double lag = std::max(2.0 * s_period, filter_w * 0.5 + s_period);
-  const double target = s_ring[s_newest].t - lag;
-  if (!s_play_valid) {
-    s_play = target;
+  const double filter_w = SmoothFilterW(now);
+  // Even presentation clock: poses carry the host time they are DUE, and
+  // the clock measured its own delay from frame arrivals (see
+  // sk83_present_clock.cpp), so the playback point is exactly the clock's
+  // evaluation time. No lag of our own: an unclamped frame's pose lands on
+  // it, an early-clamped one is interpolated across, and only a frame that
+  // arrived after it was due leaves the ring short (a hold, counted).
+  static double s_report_t = 0.0;
+  static uint64_t s_underruns = 0, s_lag_frames = 0;
+  double clock_play = 0.0;
+  g_smooth_held = false;
+  if (content_t >= 0.0 && ::sk83_present_clock::ContentTime(now, &clock_play) >= 0.0) {
+    s_play = clock_play;
     s_play_valid = true;
+    ++s_lag_frames;
+    g_smooth_held = s_ring[s_newest].t < s_play - 0.0005;
+    if (g_smooth_held) ++s_underruns;
+    if (now - s_report_t > 10.0) {
+      if (s_report_t > 0.0) {
+        REXLOG_INFO("native-scene smoother: on present clock, {} holds in {} frames",
+                    s_underruns, s_lag_frames);
+      }
+      s_report_t = now;
+      s_underruns = s_lag_frames = 0;
+    }
   } else {
-    s_play += frame_dt;
-    const double err = target - s_play;
-    if (err > 0.1 || err < -0.1) {
-      s_play = target;  // fell far behind/ahead (hitch): snap the clock
+    const double lag = std::max(2.0 * s_period, filter_w * 0.5 + s_period);
+    const double target = s_ring[s_newest].t - lag;
+    if (!s_play_valid) {
+      s_play = target;
+      s_play_valid = true;
     } else {
-      s_play += err * 0.06;
+      s_play += frame_dt;
+      const double err = target - s_play;
+      if (err > 0.1 || err < -0.1) {
+        s_play = target;  // fell far behind/ahead (hitch): snap the clock
+      } else {
+        s_play += err * 0.06;
+      }
     }
   }
   // Never play past the newest sample: when panning STOPS, samples stop
@@ -10517,7 +10815,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         return 1e30f;
       }
       const DynPose& lp = hh.ring[hh.newest];
-      if (now - lp.t > 0.1) {
+      if (now - lp.t > StaleWindow()) {
         return 1e30f;
       }
       if (skinned) {
@@ -10783,7 +11081,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // valid poses of DIFFERENT vehicles) rendering raw.
     const bool caster_stale_jump = [&] {
       if (!skinned || !item.caster_bank || h.count == 0 ||
-          latest.b.size() != item.bones.size() || now - latest.t > 0.1) {
+          latest.b.size() != item.bones.size() || now - latest.t > StaleWindow()) {
         return false;
       }
       const float d2 = skinned_dist2(item.bones, latest.b, h);
@@ -10830,7 +11128,15 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // shrinks below the kernel's reach. Changes closer than the floor to
     // the newest slot are not ingested (their bytes still feed the repair
     // and teleport gates); the next qualifying change carries the signal.
-    if (changed &&
+    // Even presentation clock: an UNCHANGED pose whose content time moved on
+    // is an exact sample of a held pose (see SmoothCamera's same-pose
+    // re-stamp); ingest it so a hold ends without a jump. Only while the
+    // clock drives the frame (stamps are then content times, at most one
+    // per sim frame).
+    const bool hold_restamp =
+        !changed && h.count > 0 && stamp > latest.t + 0.0005 &&
+        ::sk83_present_clock::ContentTime(now) >= 0.0;
+    if ((changed || hold_restamp) &&
         !(h.count > 0 && stamp - latest.t < kMinDynIngestSpacing)) {
       // Discontinuities reset the history (pose-size change = LOD/garment
       // swap; long gap = the entity was gone). CRUCIALLY also a translation
@@ -10842,7 +11148,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       // static props where it was visible).
       if (h.count > 0) {
         bool discontinuity =
-            now - latest.t > 0.1 ||
+            now - latest.t > StaleWindow() ||
             (skinned && latest.b.size() != item.bones.size());
         if (!discontinuity) {
           // Translation jump at the non-spinning reference (see
@@ -10944,7 +11250,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     } else if (changed && trk != nullptr) {
       trk->ing = 2;  // change withheld by the ingest spacing floor
     }
-    if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
+    if (h.count < 3 || now - h.ring[h.newest].t > StaleWindow()) {
       if (trk != nullptr) {
         trk->raw_render = 1;
       }
@@ -10992,9 +11298,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // the smooth background. Averaging bone affines componentwise over the
     // window slightly shrinks fast-swinging limb rotations (a subtle motion
     // blur), the trade the game's own 60 Hz presentation makes anyway.
-    const double filter_w = std::clamp(
-        REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
-        1e-3;
+    const double filter_w = SmoothFilterW(now);
     // Per-entity playback point. Entities whose own pose stream is SLOWER
     // than the 60 Hz character cadence (traffic vehicles tick on their own
     // sim rate) pin the shared playback clock past their newest sample;
@@ -11190,8 +11494,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
               lp[i] = q0.b[bi + i] + (q1.b[bi + i] - q0.b[bi + i]) * ba;
             }
             const bool upgraded = [&]() {
-              if (filter_w <= 0.0005 || b >= h.cen.size() ||
-                  h.cen[b][0] <= 0.5f) {
+              // Also without the boxcar (present clock: filter 0, ring poses
+              // are whole sim frames 16.7 ms apart): acc[] is then the pair
+              // lerp itself, whose action on the centroid IS the centroid's
+              // linear path, so the same pin keeps the wheel centred while
+              // the rotation stays full-norm. Skipping it here rendered the
+              // shrunk 16.7 ms chord: wheels flickering at speed.
+              if (b >= h.cen.size() || h.cen[b][0] <= 0.5f) {
                 return false;  // no centroid (junk row / undecodable VB)
               }
               const float c[3] = {h.cen[b][1], h.cen[b][2], h.cen[b][3]};
@@ -11586,9 +11895,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           std::memcpy(s_ring[s_newest].m, dp.world, sizeof(dp.world));
           s_count = std::min(s_count + 1, kDeckRing);
         }
-        const double filter_w = std::clamp(
-            REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0,
-            200.0) * 1e-3;
+        const double filter_w = SmoothFilterW(now);
         const auto deck_at = [&](double tt, float weight, float out[16]) {
           int hi = s_newest;
           int lo = (s_newest + kDeckRing - 1) % kDeckRing;
@@ -11652,14 +11959,28 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
 // payloads are complete by frame end; convert them to little-endian and
 // expand quad lists into triangle lists so the render side stays trivial.
 void Publish2dDraws(uint8_t* base) {
-  std::vector<Draw2d> frame_2d;
+  // Every container here is recycled across frames (guest render thread
+  // only): the capture list goes back to g_frame_2d with its capacity, the
+  // previous frame's published list comes back from g_scene_2d, and its
+  // per-draw vertex buffers are reused for this frame's draws. The sk83
+  // debug overlay alone is a few hundred text batches a frame, and fresh
+  // allocations for each of them were most of this function's cost.
+  static thread_local std::vector<Draw2d> frame_2d;
+  static thread_local std::vector<Draw2d> published;
+  static thread_local std::vector<std::vector<uint8_t>> verts_pool;
+  frame_2d.clear();
   {
     std::lock_guard<std::mutex> lock(g_2d_mutex);
     frame_2d.swap(g_frame_2d);
   }
   static thread_local std::vector<uint8_t> scratch_2d;
-  std::vector<Draw2d> published;
+  static thread_local std::vector<uint8_t> norm_2d;
+  published.clear();
   published.reserve(frame_2d.size());
+  // The big-quad tracer below only logs at debug level; it walks every
+  // vertex of every textured draw, so it runs only when that level is on.
+  const auto* const log2d = ::rex::GetLoggerRaw(::rex::log::core());
+  const bool trace_big_2d = log2d != nullptr && log2d->should_log(spdlog::level::debug);
   for (Draw2d& d : frame_2d) {
     // OFFSCREEN COMPOSITION draws: bracket bits carrying ONLY SimpleDraw
     // (0x20) / font (0x10) with none of the screen-pass brackets (bit 0
@@ -11694,12 +12015,13 @@ void Publish2dDraws(uint8_t* base) {
       continue;
     }
     const uint32_t bytes = d.count * d.stride;
-    scratch_2d.resize(bytes);
+    // Grow-only scratch: shrinking and re-growing zero-filled it per draw.
+    if (scratch_2d.size() < bytes) scratch_2d.resize(bytes);
     if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
       continue;
     }
     // Guest dwords are big-endian.
-    for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
+    for (size_t i = 0; i + 4 <= bytes; i += 4) {
       uint32_t v;
       std::memcpy(&v, scratch_2d.data() + i, 4);
       v = BSwap32(v);
@@ -11806,8 +12128,7 @@ void Publish2dDraws(uint8_t* base) {
       }
     }
     {
-      static thread_local std::vector<uint8_t> norm_2d;
-      norm_2d.resize(size_t(d.count) * 28);
+      if (norm_2d.size() < size_t(d.count) * 28) norm_2d.resize(size_t(d.count) * 28);
       const float one = 1.0f;
       const float zero = 0.0f;
       const uint32_t white = 0xFFFFFFFFu;
@@ -11879,20 +12200,25 @@ void Publish2dDraws(uint8_t* base) {
         // white texture instead of tinting the fill with a stale texel.
         std::memset(d.fetch, 0, sizeof(d.fetch));
       }
-      scratch_2d = norm_2d;
       d.src_stride = d.stride;
       d.stride = 28;
+    }
+    // From here the vertices are norm_2d's: always the 28-byte layout.
+    constexpr size_t kStride2d = 28;
+    const uint8_t* const nv2d = norm_2d.data();
+    if (!verts_pool.empty() && d.verts.capacity() == 0) {
+      d.verts = std::move(verts_pool.back());
+      verts_pool.pop_back();
     }
     if (d.prim == 13 && d.count % 4 == 0) {
       // Quad list -> triangle list (v0,v1,v2)(v0,v2,v3).
       const uint32_t quads = d.count / 4;
-      d.verts.resize(size_t(quads) * 6 * d.stride);
+      d.verts.resize(size_t(quads) * 6 * kStride2d);
       static constexpr uint32_t kOrder[6] = {0, 1, 2, 0, 2, 3};
       for (uint32_t q = 0; q < quads; ++q) {
         for (uint32_t t = 0; t < 6; ++t) {
-          std::memcpy(d.verts.data() + (size_t(q) * 6 + t) * d.stride,
-                      scratch_2d.data() + (size_t(q) * 4 + kOrder[t]) * d.stride,
-                      d.stride);
+          std::memcpy(d.verts.data() + (size_t(q) * 6 + t) * kStride2d,
+                      nv2d + (size_t(q) * 4 + kOrder[t]) * kStride2d, kStride2d);
         }
       }
       d.prim = 4;
@@ -11913,7 +12239,7 @@ void Publish2dDraws(uint8_t* base) {
       // triangle on the wrong corner and each box renders with a diagonal
       // wedge missing from one side.
       const uint32_t tris = d.count - 2;
-      d.verts.resize(size_t(tris) * 3 * d.stride);
+      d.verts.resize(size_t(tris) * 3 * kStride2d);
       for (uint32_t t = 0; t < tris; ++t) {
         uint32_t idx[3];
         if ((t & 1u) != 0) {
@@ -11926,14 +12252,14 @@ void Publish2dDraws(uint8_t* base) {
           idx[2] = t + 2;
         }
         for (uint32_t k = 0; k < 3; ++k) {
-          std::memcpy(d.verts.data() + (size_t(t) * 3 + k) * d.stride,
-                      scratch_2d.data() + size_t(idx[k]) * d.stride, d.stride);
+          std::memcpy(d.verts.data() + (size_t(t) * 3 + k) * kStride2d,
+                      nv2d + size_t(idx[k]) * kStride2d, kStride2d);
         }
       }
       d.prim = 4;
       d.count = tris * 3;
     } else if (d.prim == 4 || d.prim == 5) {
-      d.verts.assign(scratch_2d.begin(), scratch_2d.end());
+      d.verts.assign(nv2d, nv2d + size_t(d.count) * kStride2d);
     } else {
       continue;
     }
@@ -11944,7 +12270,7 @@ void Publish2dDraws(uint8_t* base) {
     // the 1280x720 APT space (the portrait box itself is ~8%), once per
     // texture base per 5 s window. Names the quad's texture / bracket /
     // geometry / timing for the fix.
-    if (d.fetch[0] != 0) {
+    if (trace_big_2d && d.fetch[0] != 0) {
       float mn[2] = {1e9f, 1e9f};
       float mx[2] = {-1e9f, -1e9f};
       const float* m = d.consts;  // c0..c8; c4..c7 = 2D transform rows
@@ -12033,9 +12359,20 @@ void Publish2dDraws(uint8_t* base) {
     }
     published.push_back(std::move(d));
   }
-  std::lock_guard<std::mutex> lock(g_2d_mutex);
-  g_scene_2d = std::move(published);
-  ++g_scene_2d_generation;
+  {
+    std::lock_guard<std::mutex> lock(g_2d_mutex);
+    g_scene_2d.swap(published);
+    ++g_scene_2d_generation;
+  }
+  // `published` now holds the previous frame's list: keep its vertex
+  // buffers for the next frame.
+  for (Draw2d& old : published) {
+    if (old.verts.capacity() != 0 && verts_pool.size() < 4096) {
+      old.verts.clear();
+      verts_pool.push_back(std::move(old.verts));
+    }
+  }
+  published.clear();
 }
 
 // Publish the frame's in-world spline draws: evaluate the guest B-spline
@@ -12469,7 +12806,7 @@ void RetimeSimpleDraws(FrameScene& scene, double now) {
   const double stamp =
       (g_latest_cam_tick > 0.0 && now - g_latest_cam_tick < 0.02) ? g_latest_cam_tick : now;
   if (changed && !(count > 0 && stamp - last.t < kMinDynIngestSpacing)) {
-    if (count > 0 && (now - last.t > 0.1 || last.v.size() != cur.size())) {
+    if (count > 0 && (now - last.t > StaleWindow() || last.v.size() != cur.size())) {
       count = 0;
     }
     newest = count == 0 ? 0 : (newest + 1) % kRing;
@@ -12477,7 +12814,7 @@ void RetimeSimpleDraws(FrameScene& scene, double now) {
     ring[newest].v = cur;
     count = std::min(count + 1, kRing);
   }
-  if (count < 3 || now - ring[newest].t > 0.1 || ring[newest].v.size() != cur.size()) {
+  if (count < 3 || now - ring[newest].t > StaleWindow() || ring[newest].v.size() != cur.size()) {
     return;  // not enough history: raw lines (as the items render raw)
   }
   // Pair-lerp of the ring at time tt, accumulated with `weight`.
@@ -12510,8 +12847,7 @@ void RetimeSimpleDraws(FrameScene& scene, double now) {
     }
     return true;
   };
-  const double filter_w = std::clamp(
-      REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) * 1e-3;
+  const double filter_w = SmoothFilterW(now);
   acc.assign(n * 6, 0.0f);
   bool ok = true;
   if (filter_w > 0.0005 && count >= 4) {
@@ -12606,7 +12942,486 @@ void GhostAudit(uint8_t* base, const FrameScene& scene,
   (void)base;
 }
 
+// Persistent static items (skate3_native_render_scene_static_persist); logic below.
+namespace {
+struct PersistItem {
+  uint32_t record = 0;     // MeshContext -> record pointer when built (identity check)
+  uint32_t mask = 0;       // static-skip island refresh mask
+  bool guest_skip = true;  // member of the guest skip set (else persist-only)
+  uint64_t built_frame = 0;
+  uint64_t rebuild_frame = 0;
+  DrawItem item;           // draws = the build frame's visible islands (replaced per use)
+  std::vector<DrawEntry> islands;  // every island of the mesh, by island index (host copy)
+};
+PooledFlatMap<uint32_t, PersistItem> g_persist;  // ctx -> item; render thread
+}  // namespace
+
+// ---- Guest-side static dispatch skip (see StaticSkipSet) -------------------
+StaticSkipSet g_static_skip;  // guest render thread only
+std::atomic<uint64_t> g_static_skipped{0}, g_static_considered{0};
+
+namespace {
+bool StaticSkipFamily(uint8_t fam) {
+  // Plain environment shading: 1 environment.default, 2 environmentsimple.default,
+  // 5/6 environment.reflective(_simple), 7 environmentsimple.alphatest,
+  // 8 environmentsimple.diffuse. Not decals (3/4: per-draw art addressing),
+  // trees / proxyworld / incandescent / scroll / transparent / traffic (their
+  // frame-global rows are captured from their own draws).
+  return fam == 1 || fam == 2 || (fam >= 5 && fam <= 8);
+}
+
+// Families whose items may persist host-side although the guest must keep
+// drawing them (their frame-global rows are captured from their own draws,
+// so they never join the guest skip set): 9 tree.default, 10 animated.tree,
+// 11 proxyworld.default. Same per-item eligibility and island-state checks
+// as the skip set; see skate3_native_render_scene_static_persist_more.
+bool PersistOnlyFamily(uint8_t fam) { return fam == 9 || fam == 10 || fam == 11; }
+
+void UpdateStaticSkipSet(const std::vector<DrawItem>& items, uint32_t view) {
+  StaticSkipSet& s = g_static_skip;
+  s.ctxs.clear();
+  s.masks.clear();
+  s.persist_only.clear();
+  s.view = view;
+  s.frame = g_guest_frame;
+  if (!REXCVAR_GET(skate3_native_render_scene_skip_guest_static) ||
+      REXCVAR_GET(skate3_native_render_scene_draw_fetch_adopt)) {
+    return;
+  }
+  static std::vector<std::pair<uint32_t, uint32_t>> s_cand;
+  static std::vector<uint32_t> s_veto;
+  static std::vector<uint32_t> s_po;
+  s_cand.clear();
+  s_veto.clear();
+  s_po.clear();
+  const bool persist_more = REXCVAR_GET(skate3_native_render_scene_static_persist_more);
+  std::lock_guard<std::mutex> lock(g_palette_mutex);
+  for (const DrawItem& it : items) {
+    if (it.ctx == 0 || it.retained) {
+      continue;
+    }
+    // A persistent item stays a member with its build-time mask (its islands'
+    // state was checked when it was built; the reuse path skips the lookups).
+    if (const PersistItem* pe = g_persist.find(it.ctx);
+        pe != nullptr && pe->built_frame <= g_guest_frame && pe->item.mesh == it.mesh) {
+      if (pe->guest_skip) {
+        s_cand.emplace_back(it.ctx, pe->mask);
+      } else if (persist_more) {
+        s_po.push_back(it.ctx);
+      }
+      continue;
+    }
+    bool ok = !it.dyn_entity && !it.skinned && !it.ropa && !it.cloth_quads &&
+              it.bones.empty() && it.dynobj == 0 && it.char_family == 0 && !it.decal &&
+              !it.hom && !it.water && !it.water_flowing && !it.transparent &&
+              !it.foreground && !it.xray && !it.highlight && !it.pending &&
+              it.game_rs_seen && !it.draws.empty() && it.draws.size() <= 16;
+    const bool skip_family = StaticSkipFamily(it.env_family);
+    const bool po_family = persist_more && PersistOnlyFamily(it.env_family);
+    ok = ok && (skip_family || po_family);
+    uint32_t mask = 0;
+    for (size_t i = 0; ok && i < it.draws.size(); ++i) {
+      const DrawEntry& d = it.draws[i];
+      const uint64_t ikey = DrawKey(it.ib_obj, it.vb_obj, d.base_vertex, d.start_index);
+      const IslandState* st = g_islands.find(ikey);
+      if (st == nullptr || st->reg != kIslRs || !st->rs.seen || g_islands_hot.contains(ikey)) {
+        ok = false;
+        break;
+      }
+      mask |= 1u << (((ikey >> 4) + ikey) & 31u);
+    }
+    if (ok && skip_family) {
+      s_cand.emplace_back(it.ctx, mask);
+    } else if (ok) {
+      s_po.push_back(it.ctx);
+    } else {
+      s_veto.push_back(it.ctx);
+    }
+  }
+  std::sort(s_cand.begin(), s_cand.end());
+  std::sort(s_veto.begin(), s_veto.end());
+  std::sort(s_po.begin(), s_po.end());
+  for (size_t i = 0; i < s_po.size(); ++i) {
+    const uint32_t c = s_po[i];
+    if ((i > 0 && s_po[i - 1] == c) || std::binary_search(s_veto.begin(), s_veto.end(), c) ||
+        std::binary_search(s_cand.begin(), s_cand.end(), std::make_pair(c, 0u),
+                           [](const auto& x, const auto& y) { return x.first < y.first; })) {
+      continue;  // vetoed, or the same ctx also built as a skip-set item
+    }
+    s.persist_only.push_back(c);
+  }
+  for (size_t i = 0; i < s_cand.size(); ++i) {
+    const uint32_t c = s_cand[i].first;
+    uint32_t mask = s_cand[i].second;
+    // Same ctx built into several items: union of their refresh phases.
+    while (i + 1 < s_cand.size() && s_cand[i + 1].first == c) {
+      mask |= s_cand[++i].second;
+    }
+    if (std::binary_search(s_veto.begin(), s_veto.end(), c)) {
+      continue;
+    }
+    s.ctxs.push_back(c);
+    s.masks.push_back(mask);
+  }
+  static uint64_t s_last_log = 0;
+  if (g_guest_frame - s_last_log >= 2400) {
+    s_last_log = g_guest_frame;
+    const uint64_t sk = g_static_skipped.exchange(0, std::memory_order_relaxed);
+    const uint64_t co = g_static_considered.exchange(0, std::memory_order_relaxed);
+    REXLOG_INFO("native-scene: guest static skip: {} of {} main-list entries skipped ({:.1f}%), "
+                "set {} ctxs (+{} persist-only), {} candidates vetoed",
+                sk, co, co ? 100.0 * double(sk) / double(co) : 0.0, s.ctxs.size(),
+                s.persist_only.size(), s_veto.size());
+  }
+}
+}  // namespace
+
+const StaticSkipSet* StaticSkipFor(uint32_t view, uint32_t sort_vec, uint32_t* phase_bit) {
+  const StaticSkipSet& s = g_static_skip;
+  // Built by the last BuildFrameScene (g_guest_frame unchanged since), for
+  // this view, and only its primary opaque list (+0x4ED0, the list the
+  // native scene builds its world items from).
+  if (s.ctxs.empty() || view != s.view || sort_vec != view + 0x4ED0u ||
+      s.frame != g_guest_frame || !SceneEnabled() ||
+      !REXCVAR_GET(skate3_native_render_scene_skip_guest_static) ||
+      !NativeWorldFresh()) {
+    return nullptr;
+  }
+  *phase_bit = 1u << ((32u - uint32_t(g_guest_frame & 31u)) & 31u);
+  return &s;
+}
+
+void AddGuestStaticSkipped(uint32_t skipped, uint32_t considered) {
+  g_static_skipped.fetch_add(skipped, std::memory_order_relaxed);
+  g_static_considered.fetch_add(considered, std::memory_order_relaxed);
+}
+
+// ---- Persistent static items (skate3_native_render_scene_static_persist) ----
+namespace {
+struct PersistStats {
+  uint64_t reused = 0, created = 0, inv_record = 0, inv_due = 0, inv_touch = 0, inv_set = 0, inv_select = 0;
+  uint64_t verify_n = 0, verify_bad = 0;
+  ptrdiff_t verify_off = -1;
+} g_pst;
+
+void DrainTouched() {
+  static std::vector<uint32_t> s_local;
+  bool all = false;
+  {
+    std::lock_guard<std::mutex> lock(g_touch_mutex);
+    s_local.swap(g_touch_pending);
+    all = g_touch_all;
+    g_touch_all = false;
+  }
+  if (all || g_touch_frame.size() > 200000) {
+    g_touch_frame.clear();
+    g_touch_all_frame = g_guest_frame;
+  }
+  for (const uint32_t obj : s_local) {
+    g_touch_frame[obj] = g_guest_frame;
+  }
+  g_touch_events += s_local.size();
+  s_local.clear();
+}
+
+// The static-skip set built by the previous build: mask for ctx, or false.
+// Persistence membership: the guest skip set (mask = its refresh phases,
+// *guest_skip = true) or the persist-only set (mask 0, *guest_skip = false).
+bool StaticSetMask(uint32_t ctx, uint32_t* mask);
+bool PersistSetMember(uint32_t ctx, uint32_t* mask, bool* guest_skip) {
+  if (StaticSetMask(ctx, mask)) {
+    *guest_skip = true;
+    return true;
+  }
+  const StaticSkipSet& st = g_static_skip;
+  if (st.persist_only.empty() || st.frame + 1 != g_guest_frame ||
+      !std::binary_search(st.persist_only.begin(), st.persist_only.end(), ctx)) {
+    return false;
+  }
+  *mask = 0;
+  *guest_skip = false;
+  return true;
+}
+
+bool StaticSetMask(uint32_t ctx, uint32_t* mask) {
+  const StaticSkipSet& st = g_static_skip;
+  if (st.ctxs.empty() || st.frame + 1 != g_guest_frame) return false;
+  const auto it = std::lower_bound(st.ctxs.begin(), st.ctxs.end(), ctx);
+  if (it == st.ctxs.end() || *it != ctx) return false;
+  *mask = st.masks[size_t(it - st.ctxs.begin())];
+  return true;
+}
+
+// The mesh's whole island table (+0x20 count, +0x3C DrawIndexedParameters
+// list), unfiltered, indexed like the game's visible-island indices.
+bool ReadIslandTable(uint8_t* base, uint32_t ctx, std::vector<DrawEntry>& out) {
+  uint32_t n = 0, arr = 0;
+  if (!GuestTryLoadU32(base, ctx + 0x20, &n) || !GuestTryLoadU32(base, ctx + kCtxDrawArray, &arr) ||
+      n == 0 || n > 4097 || !GuestReadableApprox(base, arr) ||
+      !GuestReadableApprox(base, arr + n * 16 - 4)) {
+    return false;
+  }
+  out.resize(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t d = arr + i * 16;
+    out[i] = DrawEntry{REX_LOAD_U32(d), REX_LOAD_U32(d + 4), REX_LOAD_U32(d + 8), REX_LOAD_U32(d + 12)};
+  }
+  return true;
+}
+
+// This frame's visible islands from the game's selection (+0x24 count, +0x34
+// index list) and the host island table: exactly BuildItemGeometry's walk
+// without re-reading the island entries. False = fall back to a full build.
+bool SelectPersistIslands(uint8_t* base, uint32_t ctx, const PersistItem& pe, InlineVec<DrawEntry, 4>& out) {
+  uint32_t n = 0, sel = 0;
+  if (!GuestTryLoadU32(base, ctx + kCtxDrawCount, &n) ||
+      !GuestTryLoadU32(base, ctx + kCtxDrawSelect, &sel) || n == 0 || n > 512 ||
+      !GuestReadableApprox(base, sel)) {
+    return false;
+  }
+  out.clear();
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t island = 0;
+    if (!GuestTryLoadU32(base, sel + i * 4, &island) || island > 4096) {
+      continue;
+    }
+    if (island >= pe.islands.size()) {
+      return false;  // outside the table: let the full build decide
+    }
+    const DrawEntry& e = pe.islands[island];
+    if (e.index_count == 0 || e.index_count > pe.item.ib_count) continue;
+    out.push_back(e);
+  }
+  return !out.empty();
+}
+
+// generated by scratchpad gen_fields.py from the clang record layout
+constexpr struct { uint16_t off, size; } kDrawItemPlainFields[] = {
+    {0, 4},  // ctx
+    {4, 4},  // lw_alpha
+    {8, 4},  // lw_entity
+    {12, 4},  // mesh
+    {16, 4},  // vb_obj
+    {20, 4},  // ib_obj
+    {24, 4},  // vb_addr
+    {28, 4},  // ib_addr
+    {32, 4},  // vb_bytes
+    {36, 4},  // ib_count
+    {40, 4},  // diffuse_tex
+    {44, 4},  // lightmap_tex
+    {48, 24},  // diffuse_fetch
+    {72, 24},  // decal_fetch
+    {96, 4},  // macro_tex
+    {100, 4},  // macro_scale
+    {104, 4},  // macro_opacity
+    {108, 4},  // scroll_u
+    {112, 4},  // scroll_v
+    {116, 2},  // pos_offset
+    {118, 2},  // uv_offset
+    {120, 2},  // uv2_offset
+    {122, 2},  // uv3_offset
+    {124, 2},  // bw_offset
+    {126, 2},  // bi_offset
+    {128, 2},  // normal_offset
+    {130, 2},  // tangent_offset
+    {132, 2},  // binormal_offset
+    {134, 1},  // tb_fmt
+    {135, 1},  // stride
+    {136, 1},  // pos_fmt
+    {137, 1},  // uv_fmt
+    {138, 1},  // uv2_fmt
+    {139, 1},  // uv3_fmt
+    {140, 1},  // normal_fmt
+    {141, 1},  // unlit
+    {142, 1},  // skinned
+    {143, 1},  // hair
+    {144, 1},  // char_family
+    {148, 288},  // char_rows
+    {436, 4},  // hair_alpha_tex
+    {440, 4},  // dirt_tex
+    {444, 1},  // decal
+    {445, 1},  // decal_tileable
+    {446, 2},  // decal_addr
+    {448, 4},  // decal_fade
+    {452, 1},  // decal2
+    {456, 24},  // decal2_fetch
+    {480, 2},  // decal2_addr
+    {484, 16},  // traffic_c7
+    {500, 4},  // traffic_c3y
+    {504, 1},  // traffic_seen
+    {505, 1},  // hom
+    {506, 1},  // hom_seen
+    {508, 16},  // hom_c2
+    {524, 8},  // hom_c7
+    {532, 4},  // hom_c1y
+    {536, 4},  // decal_art
+    {540, 1},  // transparent
+    {541, 1},  // water
+    {542, 1},  // water_flowing
+    {543, 1},  // water_opaque
+    {544, 1},  // game_rs_seen
+    {548, 24},  // game_rs
+    {572, 1},  // water_rows_seen
+    {576, 128},  // water_rows
+    {704, 4},  // water_tf4
+    {708, 1},  // ad_seen
+    {712, 12},  // ad_rows
+    {724, 24},  // ad_fetch
+    {748, 24},  // ad_lm_fetch
+    {772, 1},  // water_alpha
+    {773, 1},  // water_ocean
+    {776, 4},  // water_normal
+    {780, 4},  // water_normal2
+    {784, 4},  // water_env
+    {788, 4},  // refract_tex
+    {792, 4},  // water_mask
+    {796, 1},  // tan_fmt
+    {797, 1},  // ropa
+    {798, 1},  // char_alpha
+    {799, 1},  // char_skin
+    {800, 24},  // char_cg
+    {824, 1},  // char_cg_valid
+    {828, 24},  // char_cg_fetch
+    {852, 1},  // char_face
+    {856, 24},  // face_inj_fetch
+    {880, 4},  // face_inj_amount
+    {884, 1},  // face_inj_valid
+    {888, 24},  // char_layer_fetch
+    {912, 4},  // char_layer_amount
+    {916, 1},  // char_layer_valid
+    {917, 1},  // sss
+    {920, 4},  // sss_amount
+    {924, 24},  // sss_mask
+    {948, 1},  // shadow_caster
+    {949, 1},  // ws_caster
+    {950, 1},  // dmo_recv
+    {951, 1},  // foreground
+    {952, 1},  // xray
+    {953, 1},  // highlight
+    {956, 12},  // highlight_rgb
+    {968, 1},  // caster_cascades
+    {976, 128},  // shape_seq
+    {1104, 64},  // shape_w
+    {1168, 4},  // shape_count
+    {1172, 1},  // env_family
+    {1173, 1},  // dynobj
+    {1176, 4},  // spec_tex
+    {1180, 4},  // detail_tex
+    {1184, 4},  // detail_scale
+    {1188, 16},  // tint
+    {1204, 1},  // pending
+    {1205, 1},  // dbg_src
+    {1206, 1},  // caster_bank
+    {1207, 1},  // cloth_quads
+    {1208, 1},  // selected
+    {1209, 1},  // retained
+    {1210, 1},  // dyn_entity
+};
+static_assert(sizeof(DrawItem) == 1424, "DrawItem layout changed: regenerate kDrawItemPlainFields");
+
+// Byte offset of the first differing plain field (padding excluded), or -1.
+ptrdiff_t PersistItemDiff(const DrawItem& a, const DrawItem& b) {
+  const char* pa = reinterpret_cast<const char*>(&a);
+  const char* pb = reinterpret_cast<const char*>(&b);
+  for (const auto& f : kDrawItemPlainFields) {
+    if (std::memcmp(pa + f.off, pb + f.off, f.size) != 0) return ptrdiff_t(f.off);
+  }
+  bool same_draws = a.draws.size() == b.draws.size();
+  for (size_t k = 0; same_draws && k < a.draws.size(); ++k) {
+    same_draws = std::memcmp(&a.draws[k], &b.draws[k], sizeof(DrawEntry)) == 0;
+  }
+  if (a.bone_rows != b.bone_rows || a.fingerprint != b.fingerprint ||
+      std::memcmp(a.world, b.world, sizeof(a.world)) != 0 ||
+      std::memcmp(a.bbox_min, b.bbox_min, sizeof(a.bbox_min)) != 0 ||
+      std::memcmp(a.bbox_max, b.bbox_max, sizeof(a.bbox_max)) != 0 || !same_draws) {
+    return ptrdiff_t(!same_draws ? 2000 : 1500);
+  }
+  return -1;
+}
+
+// Valid persistent item for ctx, or nullptr (an invalid one is dropped).
+PersistItem* PersistLookup(uint8_t* base, uint32_t ctx) {
+  PersistItem* pe = g_persist.find(ctx);
+  if (pe == nullptr) return nullptr;
+  uint32_t mask = 0, record = 0;
+  const char* why = nullptr;
+  if (!GuestTryLoadU32(base, ctx, &record) || record != pe->record) {
+    ++g_pst.inv_record;
+    why = "record";
+  } else if (g_guest_frame >= pe->rebuild_frame) {
+    ++g_pst.inv_due;
+    why = "due";
+  } else if (TouchedSince(pe->item.vb_obj, pe->built_frame) ||
+             TouchedSince(pe->item.ib_obj, pe->built_frame) ||
+             TouchedSince(pe->item.mesh, pe->built_frame)) {
+    ++g_pst.inv_touch;
+    why = "touch";
+  } else if (bool gs = false; !PersistSetMember(ctx, &mask, &gs) || gs != pe->guest_skip) {
+    ++g_pst.inv_set;
+    why = "set";
+  }
+  if (why != nullptr) {
+    g_persist.erase(ctx);
+    return nullptr;
+  }
+  return pe;
+}
+
+// Make `item` (just built normally for ctx) persistent if ctx is in the static
+// set: switch it to all islands and keep a copy.
+void PersistCreate(uint8_t* base, uint32_t ctx, DrawItem& item) {
+  uint32_t mask = 0, record = 0;
+  bool guest_skip = false;
+  if (!PersistSetMember(ctx, &mask, &guest_skip) || item.draws.size() > 16 ||
+      !GuestTryLoadU32(base, ctx, &record)) {
+    return;
+  }
+  std::vector<DrawEntry> table;
+  if (!ReadIslandTable(base, ctx, table)) {
+    return;
+  }
+  if (g_persist.size() >= 8192) {
+    g_persist.clear();  // runaway backstop (streaming churn): rebuild as needed
+  }
+  PersistItem& pe = g_persist[ctx];
+  pe.record = record;
+  pe.mask = mask;
+  pe.guest_skip = guest_skip;
+  pe.built_frame = g_guest_frame;
+  pe.rebuild_frame = g_guest_frame + 32 + ((ctx >> 4) & 15u);
+  pe.item = item;
+  pe.islands = std::move(table);
+  ++g_pst.created;
+}
+
+void PersistVerify(uint8_t* base, uint32_t ctx, const DrawItem& kept) {
+  DrawItem fresh;
+  ++g_pst.verify_n;
+  const bool ok = BuildItemGeometry(base, ctx, fresh);
+  const ptrdiff_t off = ok ? PersistItemDiff(kept, fresh) : 0;
+  if (off >= 0) {
+    ++g_pst.verify_bad;
+    if (g_pst.verify_off < 0) g_pst.verify_off = off;
+  }
+}
+
+void PersistReport() {
+  static uint64_t s_last = 0;
+  if (g_guest_frame - s_last < 2400) return;
+  s_last = g_guest_frame;
+  REXLOG_INFO(
+      "native-scene: static persist: reused {} created {} | dropped record {} due {} touch {} set {} select {} "
+      "| store {} touch events {} | verify {} of {} differ (first at byte {})",
+      g_pst.reused, g_pst.created, g_pst.inv_record, g_pst.inv_due, g_pst.inv_touch, g_pst.inv_set,
+      g_pst.inv_select,
+      g_persist.size(), g_touch_events, g_pst.verify_bad, g_pst.verify_n, g_pst.verify_off);
+  g_pst = PersistStats{};
+  g_touch_events = 0;
+}
+}  // namespace
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
+  ::sk83_guest_profiler::NoteFrame();  // frame boundary for the guest profiler
   BuildSectScope build_sect_scope;
   if (!SceneEnabled()) {
     return;
@@ -12620,6 +13435,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // guest base from the very first natively rendered boot frame.
   g_guest_base.store(base, std::memory_order_relaxed);
   ++g_guest_frame;  // paces the world-item cache revalidation
+  DrainTouched();
   // Perf telemetry: guest frame interval + this frame's capture-hook cost.
   static PerfClock::time_point s_last_frame_tp{};
   // Previous frame's phase costs, for the slow-frame attribution below (a
@@ -12638,6 +13454,68 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // Attribute dips: the previous frame stretched the interval - log its
     // phase breakdown. "rest" = the game's own frame work + hook overhead
     // outside the build (dt minus our measured blocks).
+    {
+      // Always-on slow-frame attribution (one line per 10 s): which part of
+      // a guest frame grows when it runs long (the smoothness monitor's
+      // "late"/"guest" causes = these frames). slow = > 1.5x the window
+      // median interval. cap = draw-capture hooks, build = this scene
+      // build, rest = everything else on the guest render thread (the
+      // game's own frame work and its waits).
+      // cpu = the guest render thread's own CPU time over the interval
+      // (thread cycles / TSC ticks x dt): dt - cpu is time it was not
+      // running (blocked in a wait, or switched out by the OS).
+      struct GF {
+        float dt, cap, build, cpu;
+      };
+      static std::vector<GF> s_gf;
+      static PerfClock::time_point s_gf_t0 = build_t0;
+      static uint64_t s_thr_cyc = 0, s_tsc = 0;
+      ULONG64 thr_cyc = 0;
+      QueryThreadCycleTime(GetCurrentThread(), &thr_cyc);
+      const uint64_t tsc = __rdtsc();
+      const double cpu_frac =
+          (s_tsc != 0 && tsc > s_tsc) ? double(thr_cyc - s_thr_cyc) / double(tsc - s_tsc) : 1.0;
+      s_thr_cyc = thr_cyc;
+      s_tsc = tsc;
+      if (dt_ms < 100.0) {
+        s_gf.push_back(GF{float(dt_ms), float(double(s_prev_cap_ns) * 1e-6),
+                          float(double(s_prev_build_ns) * 1e-6),
+                          float(dt_ms * std::clamp(cpu_frac, 0.0, 1.0))});
+      }
+      if (build_t0 - s_gf_t0 > std::chrono::seconds(10)) {
+        s_gf_t0 = build_t0;
+        if (s_gf.size() >= 50) {
+          std::vector<float> dts;
+          dts.reserve(s_gf.size());
+          for (const GF& g : s_gf) dts.push_back(g.dt);
+          std::nth_element(dts.begin(), dts.begin() + dts.size() / 2, dts.end());
+          const float med = dts[dts.size() / 2];
+          double n[2] = {}, sdt[2] = {}, scap[2] = {}, sbuild[2] = {}, scpu[2] = {};
+          float worst = 0.0f;
+          for (const GF& g : s_gf) {
+            const int k = g.dt > 1.5f * med ? 1 : 0;
+            n[k] += 1;
+            sdt[k] += g.dt;
+            scap[k] += g.cap;
+            sbuild[k] += g.build;
+            scpu[k] += g.cpu;
+            worst = std::max(worst, g.dt);
+          }
+          const auto avg = [&](double* s, int k) { return n[k] > 0 ? s[k] / n[k] : 0.0; };
+          REXLOG_INFO(
+              "guest frames: {} median {:.2f} ms, worst {:.1f} | slow (>1.5x) {}: dt {:.2f} = "
+              "cap {:.2f} + build {:.2f} + rest {:.2f} | normal: dt {:.2f} = cap {:.2f} + "
+              "build {:.2f} + rest {:.2f} ms | thread running: slow {:.2f} normal {:.2f} ms "
+              "(not running: slow {:.2f} normal {:.2f})",
+              s_gf.size(), med, worst, uint64_t(n[1]), avg(sdt, 1), avg(scap, 1),
+              avg(sbuild, 1), avg(sdt, 1) - avg(scap, 1) - avg(sbuild, 1), avg(sdt, 0),
+              avg(scap, 0), avg(sbuild, 0), avg(sdt, 0) - avg(scap, 0) - avg(sbuild, 0),
+              avg(scpu, 1), avg(scpu, 0), avg(sdt, 1) - avg(scpu, 1),
+              avg(sdt, 0) - avg(scpu, 0));
+        }
+        s_gf.clear();
+      }
+    }
     if (dt_ms >= 4.5 && dt_ms < 100.0 &&
         g_slow_frame_log_budget.load(std::memory_order_relaxed) > 0 &&
         g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -12962,6 +13840,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (view == 0) {
     return;
   }
+  g_main_scene_view.store(view, std::memory_order_relaxed);
 
   FrameScene scene;
   scene.sdraw_verts = g_last_sdraw;
@@ -13022,7 +13901,32 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       scene.occl_build_skipped.reserve(s_build_culled.size());
     }
   }
+  const bool persist_on = REXCVAR_GET(skate3_native_render_scene_static_persist);
+  const bool persist_verify = REXCVAR_GET(skate3_native_render_scene_static_persist_verify);
   for (size_t i = 0; i < count; ++i) {
+    if (persist_on) {
+      // Prefetch pipeline for upcoming persistent items: 8 records ahead the
+      // MeshContext line (identity + selection fields), 4 ahead the item copy
+      // source, its island table and the game's visible-island index list
+      // (pointer read from the now-cached MeshContext line).
+      const auto main_rec = [&](size_t k) {
+        return k < count && records[k].kind == 1 && records[k].c == view && records[k].b == 20176;
+      };
+      if (main_rec(i + 8) && g_persist.find(records[i + 8].a) != nullptr) {
+        __builtin_prefetch(REX_RAW_ADDR(records[i + 8].a));
+      }
+      if (main_rec(i + 4)) {
+        if (const PersistItem* pe = g_persist.find(records[i + 4].a)) {
+          const char* pp = reinterpret_cast<const char*>(pe);
+          for (size_t off = 0; off < sizeof(PersistItem); off += 64) __builtin_prefetch(pp + off);
+          if (!pe->islands.empty()) __builtin_prefetch(pe->islands.data());
+          uint32_t sel = 0;
+          if (GuestTryLoadU32(base, records[i + 4].a + kCtxDrawSelect, &sel) && sel >= 0x10000) {
+            __builtin_prefetch(REX_RAW_ADDR(sel));
+          }
+        }
+      }
+    }
     const SubmitRecord& r = records[i];
     // Primary opaque list of the chosen view only; other lists (shadow
     // culling, transparents, z-prepass) duplicate the same geometry through
@@ -13145,8 +14049,25 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // Built straight into the published list: a DrawItem is ~1 KB of plain
     // fields, and building into a local then moving it in copied them twice
     // per world item per frame. Every non-publishing path pops it again.
-    DrawItem& item = scene.items.emplace_back();
-    if (BuildItemGeometry(base, r.a, item)) {
+    // Persistent static item: no guest walk at all (see PersistLookup).
+    PersistItem* pe = persist_on ? PersistLookup(base, r.a) : nullptr;
+    if (pe != nullptr) {
+      scene.items.push_back(pe->item);
+      if (SelectPersistIslands(base, r.a, *pe, scene.items.back().draws)) {
+        ++g_pst.reused;
+        if (persist_verify) PersistVerify(base, r.a, scene.items.back());
+      } else {
+        ++g_pst.inv_select;
+        g_persist.erase(r.a);
+        pe = nullptr;
+        scene.items.back() = DrawItem{};
+      }
+    } else {
+      scene.items.emplace_back();
+    }
+    const bool from_persist = pe != nullptr;
+    DrawItem& item = scene.items.back();
+    if (from_persist || BuildItemGeometry(base, r.a, item)) {
       if (item.skinned) {
         // Skinned meshes reached through the world sort lists (flags,
         // banners) have no captured palette, bind-pose garbage; skip.
@@ -13172,9 +14093,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // this path collapses it at the origin. Defer; the post-loop
         // publish serves the ctx owner's instance matrix, and only for
         // ctxs no live dynamic capture covered this frame.
+        if (from_persist) g_persist.erase(r.a);
         sortlist_local_by_ctx.try_emplace(r.a, std::move(item));
         scene.items.pop_back();
         continue;
+      }
+      if (persist_on && !from_persist) {
+        PersistCreate(base, r.a, item);
       }
     } else {
       scene.items.pop_back();
@@ -13197,6 +14122,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  PersistReport();
   if (wloop_prof) {
     g_pw_bi_wloop.Add(PerfNsSince(wloop_t0));
   }
@@ -13432,8 +14358,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         static uint32_t s_wse_log = 0;
         if ((s_wse_log++ % 600u) == 0u) {
           REXLOG_INFO("native-scene: world-shade casters from the pass's own draws: {} keys -> "
-                      "{} published + {} by caster-list mesh, {} unresolved",
-                      ws_entries.size(), from_pub, from_ctx, unresolved);
+                      "{} published + {} by caster-list mesh, {} unresolved | {} meshes "
+                      "recorded without guest draws (since last)",
+                      ws_entries.size(), from_pub, from_ctx, unresolved,
+                      g_ws_direct_meshes.exchange(0, std::memory_order_relaxed));
         }
       } else if (!ws_view_ctxs.empty()) {
         std::unordered_map<uint32_t, size_t> pub_mesh;
@@ -14936,8 +15864,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       std::memcpy(scene.player_head, pose.head, sizeof(pose.head));
       if (REXCVAR_GET(skate3_native_render_scene_smooth_camera) && history.size() > 1 &&
           g_smooth_play >= history.front().t && g_smooth_play <= now) {
-        const double width = std::clamp(
-            REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0)*1e-3;
+        const double width = SmoothFilterW(now);
         std::fill(std::begin(scene.player_head), std::end(scene.player_head), 0.0f);
         for (int tap=0; tap<8; ++tap) {
           const double t = std::clamp(g_smooth_play + ((tap+0.5)/8.0-0.5)*width,
@@ -15772,6 +16699,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
   scene.play_time = g_smooth_active ? g_smooth_play : 0.0;
+  scene.smooth_held = g_smooth_active && g_smooth_held;
   if (REXCVAR_GET(skate3_native_render_scene_ghost_audit)) {
     GhostAudit(base, scene, draw_rs);
   }
@@ -15845,6 +16773,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  UpdateStaticSkipSet(scene.items, view);
   g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count(),

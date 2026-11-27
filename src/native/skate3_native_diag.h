@@ -127,6 +127,9 @@ float YawFromViewRows(const float view[16]);
 
 // Append one entry while the window is open (bounded; thread-safe).
 void CamSigPush(double t, double play_t, float yaw, uint8_t kind);
+// Sim tick events (kind 3: RealTimeController update with target tick, alpha and
+// the frame dt; kind 4: the main thread started sim tick `tick`).
+void CamSigPushTick(double t, uint8_t kind, uint32_t tick, float alpha, float dt);
 
 // Per-frame tick (guest render thread, scene build): appends the raw frame
 // pose (kind 2) and, when smoothed_rot is non-null, the smoother's output

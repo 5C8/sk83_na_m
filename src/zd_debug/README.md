@@ -731,6 +731,13 @@ pipe is popped from the font loader and the asset-activation loader thread at
 once during startup in m's own code. Not yet proven to be (or not to be)
 caused by the port.
 
+**Update 2026-11-17:** still open, and seen with the native render decomp off too. The crash
+is in the game's lock-free EventSys message pipe (handler vtable 0 at dispatch: the message was
+recycled before EventSys::Flush on the render thread called it). A *separate* load race (a
+`_purecall` on the streamer controller, DataSysMan::SetStreamerController deleting before
+publishing) was fixed in `src/main.cpp` (`sk83_streamer_swap_fix`); unhandled crashes now log a
+host chain (`[crash]`) for symbolizing.
+
 Before 2026-10-15 a block's gate only worked when other transplanted code also
 referenced the same option (unmapped cvar object = option off), so some
 options counted as verified earlier never ran; fixed in zdx.py.

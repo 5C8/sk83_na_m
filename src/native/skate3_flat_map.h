@@ -133,6 +133,32 @@ class FlatMap {
   size_t mask_ = 0;
 };
 
+// Per-shader-object classification memo (the OnDrawDone classifiers look a
+// shader up several times per draw). Mirrors the std::unordered_map subset
+// those call sites use -- find / end / emplace / size / clear -- with find
+// returning an Entry pointer (it->second) and end() == nullptr.
+template <typename V>
+class ObjClassCache {
+ public:
+  using Entry = typename FlatMap<uint32_t, V>::Entry;
+  Entry* find(uint32_t k) {
+    V* v = map_.find(k);
+    // Entry is {K first; V second;}: step back from the value to its entry.
+    return v != nullptr ? reinterpret_cast<Entry*>(reinterpret_cast<char*>(v) - offsetof(Entry, second))
+                        : nullptr;
+  }
+  static constexpr Entry* end() { return nullptr; }
+  void emplace(uint32_t k, V v) {
+    auto r = map_.try_emplace(k);
+    if (r.second) *r.first = v;
+  }
+  size_t size() const { return map_.size(); }
+  void clear() { map_.clear(); }
+
+ private:
+  FlatMap<uint32_t, V> map_;
+};
+
 template <typename K>
 class FlatSet {
  public:

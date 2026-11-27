@@ -11,6 +11,9 @@
 
 #include "generated/sk83_na_m_init.h"
 
+namespace sk83_replay { void CapturePoint(uint32_t fn, PPCContext& ctx, uint8_t* base); }
+namespace sk83_render_game { void RenderBody(PPCContext& ctx, uint8_t* base); }
+
 // zd 8390D618 -> m 829792F8
 extern "C" REX_FUNC(rex_Sk8_Render_PostFX_GetColourCubeKeyFromViewPosition_IAA_KXZ_829792F8) {
   if (!zd_debug::Enabled() || !zdx::Ready()) {
@@ -1213,6 +1216,7 @@ extern "C" REX_FUNC(rex_Sk8_Pedestrian_UpdateHandPropTargetTransform_AAAXM_Z_831
 
 // zd 83925740 -> m 829ACA40: debug blocks kbDrawSHLightingProbes_262, kbDrawVisCurtains_370
 extern "C" REX_FUNC(sub_829ACA40) {
+  sk83_replay::CapturePoint(0x829ACA40u, ctx, base);   // --sk83_replay (no-op unless armed)
   // options are tested first: m's function cannot change them, and the
   // entry registers are only copied when a block will run
   bool on[2] = {};
@@ -1222,11 +1226,11 @@ extern "C" REX_FUNC(sub_829ACA40) {
     any |= on[1] = zdx::OptionOn(base, 0x8490146Cu, 32u, 0x83D91558u);
   }
   if (!any) {
-    __imp__sub_829ACA40(ctx, base);
+    sk83_render_game::RenderBody(ctx, base);
     return;
   }
   PPCContext entry = ctx;  // argument registers for the blocks
-  __imp__sub_829ACA40(ctx, base);
+  sk83_render_game::RenderBody(ctx, base);
   if (on[0]) {
     zdx::TraceBlock("83925740_kbDrawSHLightingProbes_262");
     zdx::GuestCall call(entry, base, 352);

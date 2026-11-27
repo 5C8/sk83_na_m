@@ -4,7 +4,7 @@
 # SDK integration lives in cmake/ReXGlue.cmake (independent of codegen).
 
 cmake_minimum_required(VERSION 3.25)
-project(sk83_na_m VERSION 1.0.0 LANGUAGES CXX)
+project(sk83_na_m VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +59,9 @@ set(SK83NAM_SOURCES
     src/skate3_controller_port.cpp
     src/skate3_deck_shadow.cpp
     src/skate3_frustum_cull.cpp
+    src/sk83_present_clock.cpp
+    src/sk83_guest_profiler.cpp
+    src/sk83_guest_replay.cpp
     src/skate3_anim_twoconsec.cpp
     src/skate3_safe_callstack.cpp
     src/skate3_localizer_formatters.cpp
@@ -81,6 +84,16 @@ set(SK83NAM_SOURCES
                                     # 0x8247DCF0, 0x82792900, 0x827E1AD8,
                                     # 0x8288DC58) -- won't link.
     src/native/skate3_native_diagnostics.cpp
+    src/native/sk83_native_physics.cpp
+    src/native/sk83_native_anim.cpp
+    src/native/sk83_native_render_game.cpp
+    src/native/sk83_native_sync.cpp
+    src/native/sk83_buffer_events.cpp
+    src/native/sk83_job_timeline.cpp
+    src/native/sk83_audio_thread.cpp
+    src/native/sk83_lw_jobs.cpp
+    src/native/sk83_anim_header.cpp
+    src/native/sk83_native_collision.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp
@@ -167,10 +180,10 @@ target_compile_definitions(sk83_na_m PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:SK83_VERSION_STRING="${PROJECT_VERSION}">
     $<$<COMPILE_LANGUAGE:CXX>:SK83_BUILD_CONFIG="$<CONFIG>">)
 
-# The recompiler lowers the guest's multiply-add instructions as unfused
-# add(mul(a,b), c) -- two roundings. Letting the compiler contract our native
-# reimplementations into FMA (one rounding) puts them a few ulp off the guest,
-# which breaks the differential harnesses. Match the guest.
+# Native reimplementations must round exactly like the recompiled guest code.
+# The current SDK lowers vmaddcfp128 FUSED (simde_mm_fmadd_ps) and fmadds as
+# float(std::fma(...)), so those are written as explicit fmaf; separate guest
+# vmulfp/vaddfp must stay separate, so implicit contraction stays off.
 set_source_files_properties(
     src/skate3_anim_twoconsec.cpp
     PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
@@ -289,6 +302,8 @@ target_link_libraries(sk83_na_m PRIVATE d3d11 dxgi dxguid gdiplus)
 # runtime DLL staged next to the exe (loaded on demand; without it, or
 # without SteamVR, the game simply runs flat).
 target_include_directories(sk83_na_m PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
+# decompiled sources (src/native/decomp, see its README): their support headers
+target_include_directories(sk83_na_m PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/native/decomp/support)
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/openvr/openvr_api.dll")
     add_custom_command(TARGET sk83_na_m POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -676,6 +676,10 @@ struct FrameScene {
   // items were posed at (the smoother's g_smooth_play); 0 = not smoothed.
   // DIAGNOSTIC: the pace recorder compares it against present times.
   double play_time = 0.0;
+  // The smoother's playback point had run past its newest pose (a sim frame
+  // arrived after it was due): this scene's motion is held. Smoothness
+  // monitor cause attribution.
+  bool smooth_held = false;
   // Native reproduction of a PhotoEffects portrait pass (see PhotoJob):
   // render only `items` with this camera over clear_color, no post, into
   // the 1152x640 photo target.
@@ -1155,6 +1159,37 @@ bool CopyOcclusionCulledCtxs(std::vector<uint32_t>& out);
 // Counts sort-list entries the guest-side filter kept away from the guest
 // dispatcher (frame-stats telemetry).
 void AddGuestOcclSkipped(uint32_t n);
+// The guest's main camera SceneRenderView, as BuildFrameScene last picked it
+// (0 = none yet).
+inline std::atomic<uint32_t> g_main_scene_view{0};
+// True when the guest's z-prepass of `view` (RenderZPrePass, 0x8297A478) can
+// be skipped: skate3_native_render_scene_skip_guest_zprepass, the native scene
+// on and drawing the world (a rendered frame within 250 ms), and `view` the
+// main camera view. Guest render thread.
+bool SkipGuestZPrepass(uint32_t view);
+// A native (non-portrait) frame rendered within the last 250 ms, i.e. the
+// native renderer is the one drawing the world.
+bool NativeWorldFresh();
+// Guest-side static dispatch skip (skate3_native_render_scene_skip_guest_static):
+// MeshContexts of plain static world items the last BuildFrameScene built
+// completely from its own caches, so the game's per-draw material setup,
+// D3D calls and our draw hook for them produce nothing the native renderer
+// needs. ctxs sorted ascending; masks[i] = bit p set when one of the item's
+// islands takes its staggered render-state refresh on frames with
+// (g_guest_frame + p) % 32 == 0 (the hook must see the draw then).
+struct StaticSkipSet {
+  std::vector<uint32_t> ctxs;
+  std::vector<uint32_t> masks;
+  // Persist-only members (sorted): host-persistent, still drawn by the guest.
+  std::vector<uint32_t> persist_only;
+  uint32_t view = 0;
+  uint64_t frame = 0;
+};
+// The set for this dispatch, or nullptr when it does not apply (cvar off,
+// native scene not drawing, not the main view's opaque list, stale).
+// *phase_bit receives the current frame's refresh bit. Guest render thread.
+const StaticSkipSet* StaticSkipFor(uint32_t view, uint32_t sort_vec, uint32_t* phase_bit);
+void AddGuestStaticSkipped(uint32_t skipped, uint32_t considered);
 
 // Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
 // renderengine::Texture object.
@@ -1340,6 +1375,14 @@ uint64_t DrawSequence();
 // + 20220 is the MeshContext* vector it renders (verified F11: 81 ctxs =
 // the pass's 81 distinct buffers).
 void OnWorldShadowRender(uint8_t* base, uint32_t owner);
+// Brackets the world-shade pass's render function. Inside it, once one of
+// its draws was recognized as a world-shade draw, RenderShadowMesh calls
+// WorldShadeMeshDirect: it records the mesh's shadow islands exactly as the
+// post-draw hook would and returns true, and the guest D3D draws are
+// skipped (the native renderer re-renders the map from these records).
+void BeginWorldShadowPass();
+void EndWorldShadowPass();
+bool WorldShadeMeshDirect(uint8_t* base, uint32_t mesh_context);
 
 uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path = false,
                              bool drew_inside = false);
@@ -1382,6 +1425,10 @@ void FlushMeshCache();
 // camera with the stick at a steady rate while it runs; offline analysis
 // shows whether the game's own pose sequence is irregular at the source.
 void RecordCameraSignal(double seconds);
+
+// Latency test (F12): the camera-signal window plus the present recorder over
+// the same seconds; analyse with tools/latency_lab.py.
+void RecordLatencyTest(double seconds);
 
 // F7: dump the rolling per-frame scene-composition ring (one compact
 // signature per item per frame for the last ~900 frames) to

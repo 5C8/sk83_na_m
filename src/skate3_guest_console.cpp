@@ -19,6 +19,7 @@
 #include <imgui.h>
 #include <rex/logging.h>
 
+#include <atomic>
 #include <mutex>
 
 #include "generated/sk83_na_m_init.h"  // REX_RAW_ADDR
@@ -299,6 +300,10 @@ const char* KindLabel(uint8_t k) {
 namespace {
 std::mutex g_pending_mutex;
 std::vector<PendingSet> g_pending;
+// Lock-free "anything queued?" check: ApplyPendingGuestCVarSets runs on every
+// guest draw (OnDrawDone), and locking the mutex there just to find the
+// queue empty was a measurable share of the draw hook.
+std::atomic<bool> g_pending_any{false};
 }  // namespace
 
 void QueueGuestCVarSet(const PendingSet& set) {
@@ -306,12 +311,17 @@ void QueueGuestCVarSet(const PendingSet& set) {
   if (g_pending.size() < 64) {
     g_pending.push_back(set);
   }
+  g_pending_any.store(true, std::memory_order_release);
 }
 
 void ApplyPendingGuestCVarSets(uint8_t* /*base*/) {
+  if (!g_pending_any.load(std::memory_order_acquire)) {
+    return;
+  }
   std::vector<PendingSet> todo;
   {
     std::lock_guard<std::mutex> lock(g_pending_mutex);
+    g_pending_any.store(false, std::memory_order_relaxed);
     if (g_pending.empty()) {
       return;
     }
